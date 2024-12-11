@@ -173,6 +173,61 @@ export class MempoolMonitor {
     }
   }
 
+  private convertBigIntToString(obj: any): any {
+    if (obj === null || obj === undefined) {
+      return obj;
+    }
+
+    if (typeof obj === "bigint") {
+      return obj.toString();
+    }
+
+    if (Array.isArray(obj)) {
+      return obj.map((item) => this.convertBigIntToString(item));
+    }
+
+    if (typeof obj === "object") {
+      return Object.fromEntries(
+        Object.entries(obj).map(([key, value]) => [
+          key,
+          this.convertBigIntToString(value),
+        ])
+      );
+    }
+
+    return obj;
+  }
+
+  private convertStringToBigInt(obj: any): any {
+    if (obj === null || obj === undefined) {
+      return obj;
+    }
+
+    // Check if string is a valid numeric string that could be a BigInt
+    if (typeof obj === "string" && /^\d+$/.test(obj)) {
+      try {
+        return BigInt(obj);
+      } catch {
+        return obj;
+      }
+    }
+
+    if (Array.isArray(obj)) {
+      return obj.map((item) => this.convertStringToBigInt(item));
+    }
+
+    if (typeof obj === "object") {
+      return Object.fromEntries(
+        Object.entries(obj).map(([key, value]) => [
+          key,
+          this.convertStringToBigInt(value),
+        ])
+      );
+    }
+
+    return obj;
+  }
+
   private async storePrediction(
     blockNumber: number,
     txs: string[],
@@ -180,11 +235,24 @@ export class MempoolMonitor {
     transactionDetails: { [txHash: string]: any }
   ) {
     try {
+      // Convert parameters that might contain BigInt to regular numbers
+      const processedDetails = Object.fromEntries(
+        Object.entries(transactionDetails).map(([hash, details]) => [
+          hash,
+          {
+            ...details,
+            params: details.params
+              ? this.convertBigIntToString(details.params)
+              : undefined,
+          },
+        ])
+      );
+
       const prediction = new BlockPrediction();
       prediction.blockNumber = blockNumber;
       prediction.predictedTransactions = txs;
-      prediction.predictedGasPrice = Number(avgGasPrice);
-      prediction.transactionDetails = transactionDetails;
+      prediction.predictedGasPrice = Number(avgGasPrice) / 1e9; // Convert to Gwei
+      prediction.transactionDetails = processedDetails;
 
       await this.db.getRepository(BlockPrediction).save(prediction);
       this.logger.info(
@@ -192,6 +260,38 @@ export class MempoolMonitor {
       );
     } catch (error) {
       this.logger.error("Error storing prediction:", error);
+    }
+  }
+
+  private async loadPrediction(
+    blockNumber: number
+  ): Promise<BlockPrediction | null> {
+    try {
+      const prediction = await this.db
+        .getRepository(BlockPrediction)
+        .findOne({ where: { blockNumber } });
+
+      if (prediction && prediction.transactionDetails) {
+        // Convert stored string values back to BigInt where appropriate
+        prediction.transactionDetails = Object.fromEntries(
+          Object.entries(prediction.transactionDetails).map(
+            ([hash, details]) => [
+              hash,
+              {
+                ...details,
+                params: details.params
+                  ? this.convertStringToBigInt(details.params)
+                  : undefined,
+              },
+            ]
+          )
+        );
+      }
+
+      return prediction;
+    } catch (error) {
+      this.logger.error("Error loading prediction:", error);
+      return null;
     }
   }
 
