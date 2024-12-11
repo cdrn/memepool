@@ -29,7 +29,7 @@ const dataSource = new DataSource({
   password: process.env.DB_PASSWORD || "postgres",
   database: process.env.DB_NAME || "memepool",
   entities: [BlockPrediction, BlockComparison],
-  synchronize: true, // Be careful with this in production
+  synchronize: true,
   logging: true,
 });
 
@@ -41,11 +41,18 @@ app.use(express.json());
 // API Routes
 app.get("/api/predictions", async (req, res) => {
   try {
-    const predictions = await dataSource.getRepository(BlockPrediction).find({
-      order: { blockNumber: "DESC" },
-      take: 100,
+    const [predictions, totalCount] = await Promise.all([
+      dataSource.getRepository(BlockPrediction).find({
+        order: { blockNumber: "DESC" },
+        take: 100,
+      }),
+      dataSource.getRepository(BlockPrediction).count(),
+    ]);
+
+    res.json({
+      predictions,
+      totalCount,
     });
-    res.json(predictions);
   } catch (error) {
     logger.error("Error fetching predictions:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -81,7 +88,7 @@ async function startApp() {
     await monitor.start();
 
     // Start express server
-    const port = process.env.PORT || 3000;
+    const port = process.env.PORT || 3001;
     app.listen(port, () => {
       logger.info(`Server running on port ${port}`);
     });

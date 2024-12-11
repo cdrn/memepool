@@ -3,6 +3,7 @@ import { Logger } from "winston";
 import { DataSource } from "typeorm";
 import { BlockPrediction } from "../entities/BlockPrediction";
 import { BlockComparison } from "../entities/BlockComparison";
+import { ProtocolAnalyzer } from "./ProtocolAnalyzer";
 
 export class MempoolMonitor {
   private provider: ethers.WebSocketProvider;
@@ -11,11 +12,14 @@ export class MempoolMonitor {
   private pendingTransactions: Map<string, ethers.TransactionResponse> =
     new Map();
   private blockPredictions: Map<number, string[]> = new Map();
+  private lastBlockGasLimit: bigint = BigInt(30000000); // Default gas limit
+  private protocolAnalyzer: ProtocolAnalyzer;
 
   constructor(wsUrl: string, logger: Logger, db: DataSource) {
     this.provider = new ethers.WebSocketProvider(wsUrl);
     this.logger = logger;
     this.db = db;
+    this.protocolAnalyzer = new ProtocolAnalyzer(this.provider, logger);
   }
 
   async start() {
@@ -39,6 +43,7 @@ export class MempoolMonitor {
       try {
         const block = await this.provider.getBlock(blockNumber, true);
         if (block) {
+          this.lastBlockGasLimit = block.gasLimit;
           await this.compareWithPrediction(block);
           await this.cleanupOldTransactions(block);
         }
@@ -49,21 +54,75 @@ export class MempoolMonitor {
   }
 
   private async predictNextBlock() {
-    // Simple prediction based on gas price ordering
+    // Sort transactions by effective gas price (max fee for EIP-1559 txs)
     const sortedTxs = Array.from(this.pendingTransactions.values()).sort(
       (a, b) => {
-        const aGasPrice = a.gasPrice ? Number(a.gasPrice) : 0;
-        const bGasPrice = b.gasPrice ? Number(b.gasPrice) : 0;
-        return bGasPrice - aGasPrice;
+        const aPrice = this.getEffectiveGasPrice(a);
+        const bPrice = this.getEffectiveGasPrice(b);
+        return Number(bPrice - aPrice); // Higher price first
       }
     );
 
-    const predictedTxs = sortedTxs.slice(0, 100).map((tx) => tx.hash);
+    // Predict transactions that will fit in the block
+    const predictedTxs: string[] = [];
+    let totalGasUsed = BigInt(0);
+    const gasLimit = this.lastBlockGasLimit;
+    const targetGasUsed = (gasLimit * BigInt(95)) / BigInt(100); // Target 95% of gas limit
+
+    // Store transaction details for protocol analysis
+    const transactionDetails: { [txHash: string]: any } = {};
+
+    for (const tx of sortedTxs) {
+      const gasLimit = tx.gasLimit || BigInt(0);
+
+      // Skip if this transaction would exceed target gas
+      if (totalGasUsed + gasLimit > targetGasUsed) {
+        continue;
+      }
+
+      // Analyze transaction for protocol and sandwich patterns
+      const analysis = await this.protocolAnalyzer.analyzeTransaction(tx);
+      if (analysis) {
+        transactionDetails[tx.hash] = analysis;
+      }
+
+      predictedTxs.push(tx.hash);
+      totalGasUsed += gasLimit;
+
+      // Stop if we've reached target gas usage
+      if (totalGasUsed >= targetGasUsed) {
+        break;
+      }
+    }
+
     const nextBlockNumber = (await this.provider.getBlockNumber()) + 1;
     this.blockPredictions.set(nextBlockNumber, predictedTxs);
 
-    // Store prediction in database
-    await this.storePrediction(nextBlockNumber, predictedTxs);
+    // Calculate average gas price for predicted transactions
+    const avgGasPrice =
+      predictedTxs.length > 0
+        ? predictedTxs.reduce((sum, hash) => {
+            const tx = this.pendingTransactions.get(hash);
+            return sum + (tx ? this.getEffectiveGasPrice(tx) : BigInt(0));
+          }, BigInt(0)) / BigInt(predictedTxs.length)
+        : BigInt(0);
+
+    // Store prediction in database with transaction details
+    await this.storePrediction(
+      nextBlockNumber,
+      predictedTxs,
+      avgGasPrice,
+      transactionDetails
+    );
+  }
+
+  private getEffectiveGasPrice(tx: ethers.TransactionResponse): bigint {
+    // For EIP-1559 transactions
+    if (tx.maxFeePerGas) {
+      return tx.maxFeePerGas;
+    }
+    // For legacy transactions
+    return tx.gasPrice || BigInt(0);
   }
 
   private async compareWithPrediction(block: ethers.Block) {
@@ -91,6 +150,7 @@ export class MempoolMonitor {
   }
 
   private calculateAccuracy(predicted: string[], actual: string[]): number {
+    if (predicted.length === 0) return 0;
     const correctPredictions = predicted.filter((tx) => actual.includes(tx));
     return (correctPredictions.length / predicted.length) * 100;
   }
@@ -113,15 +173,23 @@ export class MempoolMonitor {
     }
   }
 
-  private async storePrediction(blockNumber: number, txs: string[]) {
+  private async storePrediction(
+    blockNumber: number,
+    txs: string[],
+    avgGasPrice: bigint,
+    transactionDetails: { [txHash: string]: any }
+  ) {
     try {
       const prediction = new BlockPrediction();
       prediction.blockNumber = blockNumber;
       prediction.predictedTransactions = txs;
-      prediction.predictedGasPrice = 0; // TODO: Calculate average gas price
+      prediction.predictedGasPrice = Number(avgGasPrice);
+      prediction.transactionDetails = transactionDetails;
 
       await this.db.getRepository(BlockPrediction).save(prediction);
-      this.logger.info(`Stored prediction for block ${blockNumber}`);
+      this.logger.info(
+        `Stored prediction for block ${blockNumber} with ${txs.length} transactions`
+      );
     } catch (error) {
       this.logger.error("Error storing prediction:", error);
     }

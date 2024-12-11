@@ -22,4 +22,14 @@ export class BlockPrediction implements IBlockPrediction {
 
   @CreateDateColumn()
   createdAt!: Date;
+
+  @Column("jsonb", { nullable: true })
+  transactionDetails: {
+    [txHash: string]: {
+      protocol?: string;
+      methodName?: string;
+      params?: any;
+      isSandwichTarget?: boolean;
+    };
+  } = {};
 }

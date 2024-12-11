@@ -1,0 +1,56 @@
+version: "3.8"
+
+services:
+  geth:
+    image: ethereum/client-go:stable
+    ports:
+      - "127.0.0.1:8545:8545" # RPC
+      - "127.0.0.1:8546:8546" # WebSocket
+      - "30303:30303" # P2P
+    volumes:
+      - ./geth-data:/root/.ethereum
+      - ./jwt.hex:/jwt.hex:ro
+    command:
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.api=eth,net,web3,txpool
+      - --http.corsdomain=*
+      - --ws
+      - --ws.addr=0.0.0.0
+      - --ws.port=8546
+      - --ws.api=eth,net,web3,txpool
+      - --ws.origins=*
+      - --txpool.globalslots=5000
+      - --txpool.globalqueue=1000
+      - --cache=4096
+      - --syncmode=snap
+      - --metrics
+      - --metrics.expensive
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.port=8551
+      - --authrpc.vhosts=*
+      - --authrpc.jwtsecret=/jwt.hex
+    restart: unless-stopped
+
+  lighthouse:
+    image: sigp/lighthouse:latest
+    ports:
+      - "9000:9000/tcp"
+      - "9000:9000/udp" # P2P port
+    volumes:
+      - ./lighthouse-data:/root/.lighthouse
+      - ./jwt.hex:/jwt.hex:ro
+    command:
+      - lighthouse
+      - beacon_node
+      - --network=mainnet
+      - --execution-endpoint=http://geth:8551
+      - --execution-jwt=/jwt.hex
+      - --checkpoint-sync-url=https://mainnet.checkpoint.sigp.io
+      - --http
+      - --http-address=0.0.0.0
+      - --metrics
+    depends_on:
+      - geth
+    restart: unless-stopped
