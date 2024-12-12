@@ -7,8 +7,16 @@ interface TransactionDetails {
   methodName?: string;
   params?: any;
   isSandwichTarget?: boolean;
-  type?: "swap" | "liquidity" | "bridge" | "lending" | "sandwich" | "unknown";
+  type?:
+    | "swap"
+    | "liquidity"
+    | "bridge"
+    | "lending"
+    | "sandwich"
+    | "unknown"
+    | "transfer";
   value?: string;
+  category?: string;
 }
 
 interface SandwichInfo {
@@ -60,17 +68,24 @@ const METHOD_SIGNATURES = {
     "0x5c11d795", // swapExactTokensForTokensSupportingFeeOnTransferTokens
     "0xc04b8d59", // exactInput
     "0xdb3e2198", // exactOutput
+    "0x791ac947", // swapExactTokensForTokensSupportingFeeOnTransferTokens
+    "0x472b43f3", // swapExactTokensForTokens
   ],
   LIQUIDITY: [
     "0xe8e33700", // addLiquidity
     "0xbaa2abde", // removeLiquidity
     "0x4515cef3", // add_liquidity (Curve)
+    "0x87b21efc", // deposit (Balancer)
   ],
   LENDING: [
     "0xe8eda9df", // deposit
     "0xa415bcad", // borrow
     "0x573ade81", // repay
     "0x69328dec", // withdraw
+  ],
+  TRANSFER: [
+    "0xa9059cbb", // transfer
+    "0x23b872dd", // transferFrom
   ],
 };
 
@@ -174,6 +189,21 @@ export class ProtocolAnalyzer {
         result.isSandwichTarget = sandwichInfo.isTarget;
       }
 
+      // Add more context for transfers
+      if (result.type === "transfer" && result.params) {
+        try {
+          const [recipient, amount] = result.params;
+          result.category = "erc20";
+          result.params = {
+            recipient,
+            amount: amount.toString(),
+            token: tx.to,
+          };
+        } catch (e) {
+          // Keep original params if parsing fails
+        }
+      }
+
       return result;
     } catch (error) {
       this.logger.error("Error analyzing transaction:", error);
@@ -202,6 +232,9 @@ export class ProtocolAnalyzer {
     if (METHOD_SIGNATURES.LENDING.includes(signature)) {
       return "lending";
     }
+    if (METHOD_SIGNATURES.TRANSFER.includes(signature)) {
+      return "transfer";
+    }
 
     // Check method names if available
     if (methodName) {
@@ -217,6 +250,13 @@ export class ProtocolAnalyzer {
       )
         return "lending";
       if (lowerMethod.includes("bridge")) return "bridge";
+      if (lowerMethod === "transfer" || lowerMethod === "transferFrom")
+        return "transfer";
+    }
+
+    // Check if it's a simple ETH transfer
+    if (tx.data === "0x" && tx.value > BigInt(0)) {
+      return "transfer";
     }
 
     return "unknown";

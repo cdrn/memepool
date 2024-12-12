@@ -30,7 +30,7 @@ const dataSource = new DataSource({
   database: process.env.DB_NAME || "memepool",
   entities: [BlockPrediction, BlockComparison],
   synchronize: true,
-  logging: true,
+  logging: ["error"],
 });
 
 // Express app setup
