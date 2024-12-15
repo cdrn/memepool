@@ -7,6 +7,7 @@ import {
   MoonIcon,
 } from "@heroicons/react/24/outline";
 import type { BlockPrediction, BlockComparison } from "@shared/types";
+import { TransactionAnalytics } from "./components/TransactionAnalytics";
 
 // Helper function to format ETH values
 const formatEther = (value: string): string => {
@@ -283,6 +284,17 @@ function App() {
           </div>
         </div>
 
+        {/* Transaction Analytics */}
+        <section className="space-y-6">
+          <h2 className="text-2xl font-light text-gray-900 dark:text-white">
+            Transaction Analytics
+          </h2>
+          <TransactionAnalytics
+            predictions={predictions}
+            comparisons={comparisons}
+          />
+        </section>
+
         {/* Recent Comparisons */}
         <section className="space-y-6">
           <h2 className="text-2xl font-light text-gray-900 dark:text-white">
@@ -312,7 +324,7 @@ function App() {
               <tbody className="font-sans">
                 {comparisons.slice(0, 10).map((comparison) => (
                   <tr
-                    key={comparison.id}
+                    key={`comparison-${comparison.blockNumber}-${comparison.id}`}
                     onClick={() => handleComparisonClick(comparison)}
                     className="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/50 cursor-pointer transition-colors"
                   >
@@ -378,7 +390,7 @@ function App() {
               <tbody className="font-sans">
                 {predictions.slice(0, 10).map((prediction) => (
                   <tr
-                    key={prediction.blockNumber}
+                    key={`prediction-${prediction.blockNumber}-${prediction.id}`}
                     className="hover:bg-gray-50 dark:hover:bg-gray-800/50 cursor-pointer"
                     onClick={() => setSelectedBlock(prediction)}
                   >
@@ -446,9 +458,9 @@ function App() {
               </div>
               <div className="p-6 overflow-y-auto max-h-[60vh]">
                 <div className="space-y-4">
-                  {selectedBlock.predictedTransactions.map((txHash) => (
+                  {selectedBlock.predictedTransactions.map((txHash, index) => (
                     <div
-                      key={txHash}
+                      key={`tx-${selectedBlock.blockNumber}-${txHash}-${index}`}
                       className="p-4 bg-gray-50 dark:bg-gray-700/50 rounded-lg"
                     >
                       <div className="flex items-start justify-between">

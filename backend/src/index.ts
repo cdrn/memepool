@@ -6,6 +6,7 @@ import { config } from "dotenv";
 import { MempoolMonitor } from "./services/MempoolMonitor";
 import { BlockPrediction } from "./entities/BlockPrediction";
 import { BlockComparison } from "./entities/BlockComparison";
+import { ContractCache } from "./entities/ContractCache";
 
 // Load environment variables
 config();
@@ -28,7 +29,7 @@ const dataSource = new DataSource({
   username: process.env.DB_USER || "postgres",
   password: process.env.DB_PASSWORD || "postgres",
   database: process.env.DB_NAME || "memepool",
-  entities: [BlockPrediction, BlockComparison],
+  entities: [BlockPrediction, BlockComparison, ContractCache],
   synchronize: true,
   logging: ["error"],
 });
@@ -78,6 +79,16 @@ async function startApp() {
     // Initialize database connection
     await dataSource.initialize();
     logger.info("Database connection established");
+
+    // Drop and recreate tables if needed
+    try {
+      await dataSource.query('DROP TABLE IF EXISTS "contract_cache" CASCADE');
+      await dataSource.synchronize();
+      logger.info("Database schema synchronized");
+    } catch (error) {
+      logger.error("Error synchronizing database schema:", error);
+      process.exit(1);
+    }
 
     // Start mempool monitor
     const monitor = new MempoolMonitor(

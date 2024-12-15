@@ -11,7 +11,9 @@
   },
   "dependencies": {
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "@nivo/core": "^0.84.0",
+    "@nivo/treemap": "^0.84.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.15.0",

@@ -1,6 +1,8 @@
 import { ethers } from "ethers";
 import axios from "axios";
 import { Logger } from "winston";
+import { ContractCacheService } from "./ContractCacheService";
+import { DataSource } from "typeorm";
 
 interface TransactionDetails {
   protocol?: string;
@@ -39,23 +41,77 @@ const COMMON_ABIS: CommonABIs = {
     "function addLiquidity(address tokenA, address tokenB, uint amountADesired, uint amountBDesired, uint amountAMin, uint amountBMin, address to, uint deadline) external returns (uint amountA, uint amountB, uint liquidity)",
     "function removeLiquidity(address tokenA, address tokenB, uint liquidity, uint amountAMin, uint amountBMin, address to, uint deadline) external returns (uint amountA, uint amountB)",
   ],
-  // Uniswap V3 Router
+  // Uniswap V3 Routers
+  "0xe592427a0aece92de3edee1f18e0157c05861564": [
+    "function exactInput(tuple(bytes path, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum) params) external payable returns (uint256 amountOut)",
+    "function exactOutput(tuple(bytes path, address recipient, uint256 deadline, uint256 amountOut, uint256 amountInMaximum) params) external payable returns (uint256 amountIn)",
+  ],
   "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45": [
     "function exactInput(tuple(bytes path, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum) params) external payable returns (uint256 amountOut)",
     "function exactOutput(tuple(bytes path, address recipient, uint256 deadline, uint256 amountOut, uint256 amountInMaximum) params) external payable returns (uint256 amountIn)",
   ],
-  // AAVE V2 Lending Pool
+  // AAVE V2 & V3
   "0x7d2768de32b0b80b7a3454c06bdac94a69ddc7a9": [
     "function deposit(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external",
     "function borrow(address asset, uint256 amount, uint256 interestRateMode, uint16 referralCode, address onBehalfOf) external",
     "function repay(address asset, uint256 amount, uint256 rateMode, address onBehalfOf) external returns (uint256)",
     "function withdraw(address asset, uint256 amount, address to) external returns (uint256)",
   ],
-  // Curve 3pool
+  "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2": [
+    // AAVE V3 Pool
+    "function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external",
+    "function borrow(address asset, uint256 amount, uint256 interestRateMode, uint16 referralCode, address onBehalfOf) external",
+  ],
+  // Curve Pools
   "0xbebc44782c7db0a1a60cb6fe97d0b483032ff1c7": [
+    // 3pool
     "function add_liquidity(uint256[3] memory amounts, uint256 min_mint_amount) external",
     "function remove_liquidity(uint256 _amount, uint256[3] memory min_amounts) external",
     "function exchange(int128 i, int128 j, uint256 dx, uint256 min_dy) external",
+  ],
+  "0xdc24316b9ae028f1497c275eb9192a3ea0f67022": [
+    // stETH pool
+    "function add_liquidity(uint256[2] memory amounts, uint256 min_mint_amount) external",
+    "function remove_liquidity(uint256 _amount, uint256[2] memory min_amounts) external",
+  ],
+  "0xd51a44d3fae010294c616388b506acda1bfaae46": [
+    // Tricrypto2
+    "function exchange(uint256 i, uint256 j, uint256 dx, uint256 min_dy) external",
+    "function add_liquidity(uint256[3] memory amounts, uint256 min_mint_amount) external",
+  ],
+  // Balancer
+  "0xba12222222228d8ba445958a75a0704d566bf2c8": [
+    // Vault
+    "function swap(tuple(bytes32 poolId, uint8 kind, address assetIn, address assetOut, uint256 amount, bytes userData) request) external returns (uint256)",
+    "function joinPool(bytes32 poolId, address sender, address recipient, tuple(address[] assets, uint256[] maxAmountsIn, bytes userData, bool fromInternalBalance) request) external",
+    "function exitPool(bytes32 poolId, address sender, address recipient, tuple(address[] assets, uint256[] minAmountsOut, bytes userData, bool toInternalBalance) request) external",
+  ],
+  // Lido
+  "0xae7ab96520de3a18e5e111b5eaab095312d7fe84": [
+    // stETH
+    "function submit(address referral) external payable returns (uint256)",
+    "function withdraw(uint256 amount, bytes32 pubkeyHash) external",
+  ],
+  // Compound
+  "0x3d9819210a31b4961b30ef54be2aed79b9c9cd3b": [
+    // Comptroller
+    "function enterMarkets(address[] calldata cTokens) returns (uint[] memory)",
+    "function exitMarket(address cToken) returns (uint)",
+  ],
+  // 1inch
+  "0x1111111254eeb25477b68fb85ed929f73a960582": [
+    // Router
+    "function swap(address caller, tuple(address srcToken, address dstToken, address srcReceiver, address dstReceiver, uint256 amount, uint256 minReturnAmount, uint256 flags) desc, bytes data) external returns (uint256 returnAmount)",
+  ],
+  // Chainlink
+  "0x47fb2585d2c5dacb4c659f2488d": [
+    // Price Feeds
+    "function latestRoundData() external view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)",
+  ],
+  // OpenSea
+  "0x00000000006c3852cbef3e08e8df289169ede581": [
+    // Seaport
+    "function fulfillBasicOrder(tuple(address considerationToken, uint256 considerationIdentifier, uint256 considerationAmount, address offerer, address zone, address offerToken, uint256 offerIdentifier, uint256 offerAmount, uint8 basicOrderType, uint256 startTime, uint256 endTime, bytes32 zoneHash, uint256 salt, bytes32 offererConduitKey, bytes32 fulfillerConduitKey, uint256 totalOriginalAdditionalRecipients, tuple(uint256 amount, address recipient)[] additionalRecipients, bytes signature) parameters) external payable returns (bool fulfilled)",
   ],
 };
 
@@ -100,6 +156,7 @@ const BRIDGE_CONTRACTS = new Set([
 export class ProtocolAnalyzer {
   private provider: ethers.Provider;
   private logger: Logger;
+  private contractCache: ContractCacheService;
   private abiCache: Map<string, any> = new Map();
   private knownProtocols: Map<string, string> = new Map();
   private potentialSandwiches: Map<
@@ -112,37 +169,50 @@ export class ProtocolAnalyzer {
     }
   > = new Map();
 
-  constructor(provider: ethers.Provider, logger: Logger) {
+  constructor(provider: ethers.Provider, logger: Logger, db: DataSource) {
     this.provider = provider;
     this.logger = logger;
+    this.contractCache = new ContractCacheService(db, logger, provider);
     this.initializeKnownProtocols();
   }
 
   private initializeKnownProtocols() {
-    this.knownProtocols.set(
-      "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45",
-      "Uniswap V3"
-    );
-    this.knownProtocols.set(
-      "0x7a250d5630b4cf539739df2c5dacb4c659f2488d",
-      "Uniswap V2"
-    );
-    this.knownProtocols.set(
-      "0xd9e1ce17f2641f24ae83637ab66a2cca9c378b9f",
-      "SushiSwap"
-    );
-    this.knownProtocols.set(
-      "0x1111111254eeb25477b68fb85ed929f73a960582",
-      "1inch"
-    );
-    this.knownProtocols.set(
-      "0x7d2768de32b0b80b7a3454c06bdac94a69ddc7a9",
-      "AAVE V2"
-    );
-    this.knownProtocols.set(
-      "0xbebc44782c7db0a1a60cb6fe97d0b483032ff1c7",
-      "Curve"
-    );
+    // Initialize known protocols
+    Object.entries(COMMON_ABIS).forEach(([address, _]) => {
+      const protocol = this.categorizeContract(address);
+      if (protocol) {
+        this.knownProtocols.set(address.toLowerCase(), protocol);
+        // Update cache with protocol info
+        this.contractCache.updateProtocolInfo(
+          address,
+          protocol,
+          this.categorizeContractType(protocol)
+        );
+      }
+    });
+  }
+
+  private categorizeContractType(protocol: string): string {
+    if (
+      protocol.includes("Uniswap") ||
+      protocol.includes("SushiSwap") ||
+      protocol.includes("1inch")
+    ) {
+      return "dex";
+    }
+    if (protocol.includes("AAVE") || protocol.includes("Compound")) {
+      return "lending";
+    }
+    if (protocol.includes("Bridge")) {
+      return "bridge";
+    }
+    if (protocol.includes("Curve")) {
+      return "amm";
+    }
+    if (protocol.includes("Chainlink")) {
+      return "oracle";
+    }
+    return "unknown";
   }
 
   async analyzeTransaction(
@@ -179,6 +249,34 @@ export class ProtocolAnalyzer {
         }
       }
 
+      // If still unknown, try to identify contract type from Etherscan
+      if (!result.protocol && process.env.ETHERSCAN_API_KEY) {
+        try {
+          const response = await axios.get(`https://api.etherscan.io/api`, {
+            params: {
+              module: "contract",
+              action: "getsourcecode",
+              address: tx.to,
+              apikey: process.env.ETHERSCAN_API_KEY,
+            },
+          });
+
+          if (response.data.status === "1" && response.data.result[0]) {
+            const contractName = response.data.result[0].ContractName;
+            if (contractName) {
+              // Add to known protocols for future use
+              this.knownProtocols.set(
+                tx.to.toLowerCase(),
+                this.categorizeContract(contractName)
+              );
+              result.protocol = this.knownProtocols.get(tx.to.toLowerCase());
+            }
+          }
+        } catch (error) {
+          // Ignore Etherscan errors
+        }
+      }
+
       // Determine transaction type
       result.type = this.determineTransactionType(tx, result.methodName);
 
@@ -193,7 +291,7 @@ export class ProtocolAnalyzer {
       if (result.type === "transfer" && result.params) {
         try {
           const [recipient, amount] = result.params;
-          result.category = "erc20";
+          result.category = await this.detectTokenType(tx.to);
           result.params = {
             recipient,
             amount: amount.toString(),
@@ -265,9 +363,16 @@ export class ProtocolAnalyzer {
   private async getContractABI(address: string): Promise<string[] | null> {
     address = address.toLowerCase();
 
-    // Check cache first
+    // Check memory cache first
     if (this.abiCache.has(address)) {
       return this.abiCache.get(address);
+    }
+
+    // Check database cache
+    const contractData = await this.contractCache.getContractData(address);
+    if (contractData?.abi) {
+      this.abiCache.set(address, contractData.abi);
+      return contractData.abi;
     }
 
     // Check common ABIs
@@ -276,58 +381,13 @@ export class ProtocolAnalyzer {
       return COMMON_ABIS[address];
     }
 
-    try {
-      // Try Sourcify first (doesn't require API key)
-      const sourcifyUrl = `https://sourcify.dev/server/repository/contracts/full_match/1/${address}/metadata.json`;
-      const response = await axios.get(sourcifyUrl);
-      if (response.data?.output?.abi) {
-        this.abiCache.set(address, response.data.output.abi);
-        return response.data.output.abi;
-      }
-    } catch (error) {
-      // Sourcify miss, try Etherscan if API key is available
-      if (process.env.ETHERSCAN_API_KEY) {
-        try {
-          const response = await axios.get(`https://api.etherscan.io/api`, {
-            params: {
-              module: "contract",
-              action: "getabi",
-              address: address,
-              apikey: process.env.ETHERSCAN_API_KEY,
-            },
-          });
-
-          if (response.data.status === "1") {
-            const abi = JSON.parse(response.data.result);
-            this.abiCache.set(address, abi);
-            return abi;
-          }
-        } catch (error) {
-          // Ignore Etherscan errors
-        }
-      }
-    }
-
-    // Cache miss
-    this.abiCache.set(address, null);
     return null;
   }
 
   private async getFunctionSignature(
     signature: string
   ): Promise<string | null> {
-    try {
-      // Try 4byte.directory
-      const response = await axios.get(
-        `https://www.4byte.directory/api/v1/signatures/?hex_signature=${signature}`
-      );
-      if (response.data?.results?.length > 0) {
-        return response.data.results[0].text_signature;
-      }
-    } catch (error) {
-      // Ignore 4byte.directory errors
-    }
-    return null;
+    return await this.contractCache.getFunctionSignature(signature);
   }
 
   private async detectSandwichPattern(
@@ -444,5 +504,45 @@ export class ProtocolAnalyzer {
       }
     }
     return false;
+  }
+
+  private categorizeContract(contractName: string): string {
+    const lowerName = contractName.toLowerCase();
+    if (lowerName.includes("swap") || lowerName.includes("amm")) return "DEX";
+    if (lowerName.includes("pool")) return "Liquidity Pool";
+    if (lowerName.includes("bridge")) return "Bridge";
+    if (lowerName.includes("vault")) return "Vault";
+    if (lowerName.includes("lending") || lowerName.includes("borrow"))
+      return "Lending Protocol";
+    if (lowerName.includes("oracle")) return "Oracle";
+    if (lowerName.includes("token")) return "Token Contract";
+    return contractName;
+  }
+
+  private async detectTokenType(address: string): Promise<string> {
+    try {
+      // Try to detect if it's an ERC20/721/1155
+      const iface = new ethers.Interface([
+        "function supportsInterface(bytes4 interfaceId) external view returns (bool)",
+      ]);
+      const contract = new ethers.Contract(address, iface, this.provider);
+
+      // ERC721 interface ID
+      const isERC721 = await contract
+        .supportsInterface("0x80ac58cd")
+        .catch(() => false);
+      if (isERC721) return "erc721";
+
+      // ERC1155 interface ID
+      const isERC1155 = await contract
+        .supportsInterface("0xd9b67a26")
+        .catch(() => false);
+      if (isERC1155) return "erc1155";
+
+      // If neither, assume ERC20
+      return "erc20";
+    } catch (e) {
+      return "unknown";
+    }
   }
 }
