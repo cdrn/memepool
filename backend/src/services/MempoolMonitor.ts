@@ -16,6 +16,25 @@ interface LogContext {
   avgGasPrice?: string;
   gasUsed?: string;
   component?: string;
+  wsUrl?: string;
+  baseFee?: string;
+  to?: string;
+  value?: string;
+  gasPrice?: string;
+  predictedTxCount?: number;
+  id?: number;
+  details?: number;
+  pendingTxCount?: number;
+  groupCount?: number;
+  totalTxs?: number;
+  maxFee?: string;
+  nextBaseFee?: string;
+  priorityFee?: string;
+  groupSize?: number;
+  totalGasUsed?: string;
+  targetGasUsed?: string;
+  type?: string;
+  protocol?: string;
 }
 
 export class MempoolMonitor {
@@ -61,28 +80,40 @@ export class MempoolMonitor {
 
   private async setupWebSocket() {
     try {
-      const ws = (this.provider as any).websocket;
-      if (ws) {
-        ws.on("error", async (error: Error) => {
-          this.log("error", "WebSocket error occurred", { error });
-          await this.handleWebSocketError();
-        });
+      this.log("info", "Setting up WebSocket connection...");
 
-        ws.on("close", async () => {
-          this.log("warn", "WebSocket connection closed");
-          await this.handleWebSocketError();
-        });
-      }
+      // Test the connection by getting the latest block
+      const blockNumber = await this.provider.getBlockNumber();
+      this.log("info", "Connected to Ethereum node", {
+        blockNumber,
+        wsUrl: this.wsUrl,
+      });
+
+      // Subscribe to pending transactions
+      await (this.provider as any).send("eth_subscribe", [
+        "newPendingTransactions",
+      ]);
+      this.log("info", "Subscribed to pending transactions");
 
       // Monitor new pending transactions with throttling
       this.provider.on("pending", async (txHash: string) => {
+        this.log("debug", "Received pending transaction", { txHash });
         try {
           await this.requestLimiter(async () => {
             const tx = await this.provider.getTransaction(txHash);
             if (tx) {
               this.pendingTransactions.set(txHash, tx);
               await this.predictNextBlock();
-              this.log("debug", "Processed pending transaction", { txHash });
+              this.log("debug", "Processed pending transaction", {
+                txHash,
+                to: tx.to || undefined,
+                value: tx.value.toString(),
+                gasPrice: (
+                  tx.gasPrice ||
+                  tx.maxFeePerGas ||
+                  BigInt(0)
+                ).toString(),
+              });
             }
           });
         } catch (error) {
@@ -92,7 +123,7 @@ export class MempoolMonitor {
           } else {
             this.log("error", "Failed to process pending transaction", {
               txHash,
-              error,
+              error: error instanceof Error ? error.message : String(error),
             });
           }
         }
@@ -100,6 +131,7 @@ export class MempoolMonitor {
 
       // Monitor new blocks with throttling
       this.provider.on("block", async (blockNumber: number) => {
+        this.log("info", "New block received", { blockNumber });
         try {
           await this.requestLimiter(async () => {
             const block = await this.provider.getBlock(blockNumber, true);
@@ -108,10 +140,13 @@ export class MempoolMonitor {
               this.lastBaseFee = block.baseFeePerGas || BigInt(0);
               await this.compareWithPrediction(block);
               await this.cleanupOldTransactions(block);
+              await this.predictNextBlock();
               this.log("info", "Processed new block", {
                 blockNumber,
                 txCount: block.transactions.length,
                 gasLimit: block.gasLimit.toString(),
+                baseFee: (block.baseFeePerGas || BigInt(0)).toString(),
+                predictedTxCount: this.pendingTransactions.size,
               });
             }
           });
@@ -124,13 +159,16 @@ export class MempoolMonitor {
           } else {
             this.log("error", "Failed to process block", {
               blockNumber,
-              error,
+              error: error instanceof Error ? error.message : String(error),
             });
           }
         }
       });
     } catch (error) {
-      this.log("error", "Failed to setup WebSocket connection", { error });
+      this.log("error", "Failed to setup WebSocket connection", {
+        error: error instanceof Error ? error.message : String(error),
+        wsUrl: this.wsUrl,
+      });
       await this.handleWebSocketError();
     }
   }
@@ -213,6 +251,10 @@ export class MempoolMonitor {
   }
 
   private async predictNextBlock() {
+    this.log("debug", "Starting next block prediction", {
+      pendingTxCount: this.pendingTransactions.size,
+    });
+
     const nextBaseFee = this.estimateNextBaseFee();
     const pendingTxs = Array.from(this.pendingTransactions.values());
 
@@ -220,7 +262,14 @@ export class MempoolMonitor {
     const txsByPriority = new Map<bigint, ethers.TransactionResponse[]>();
 
     for (const tx of pendingTxs) {
-      if (tx.maxFeePerGas && tx.maxFeePerGas < nextBaseFee) continue;
+      if (tx.maxFeePerGas && tx.maxFeePerGas < nextBaseFee) {
+        this.log("debug", "Skipping transaction due to low max fee", {
+          txHash: tx.hash,
+          maxFee: tx.maxFeePerGas.toString(),
+          nextBaseFee: nextBaseFee.toString(),
+        });
+        continue;
+      }
 
       const priorityFee = this.getEffectivePriorityFee(tx);
       const existing = txsByPriority.get(priorityFee) || [];
@@ -233,6 +282,12 @@ export class MempoolMonitor {
       Number(b - a)
     );
 
+    this.log("debug", "Grouped transactions by priority", {
+      groupCount: sortedGroups.length,
+      totalTxs: pendingTxs.length,
+      nextBaseFee: nextBaseFee.toString(),
+    });
+
     const predictedTxs: string[] = [];
     let totalGasUsed = BigInt(0);
     const gasLimit = this.lastBlockGasLimit;
@@ -243,10 +298,21 @@ export class MempoolMonitor {
     const transferTxs = new Set<string>();
 
     // Process transactions in priority order with rate limiting and caching
-    for (const [_, txGroup] of sortedGroups) {
+    for (const [priorityFee, txGroup] of sortedGroups) {
+      this.log("debug", "Processing transaction group", {
+        priorityFee: priorityFee.toString(),
+        groupSize: txGroup.length,
+      });
+
       for (const tx of txGroup) {
         const txGasLimit = tx.gasLimit || BigInt(0);
-        if (totalGasUsed + txGasLimit > targetGasUsed) continue;
+        if (totalGasUsed + txGasLimit > targetGasUsed) {
+          this.log("debug", "Block gas limit reached", {
+            totalGasUsed: totalGasUsed.toString(),
+            targetGasUsed: targetGasUsed.toString(),
+          });
+          continue;
+        }
 
         let analysis;
         // Check cache first
@@ -278,6 +344,11 @@ export class MempoolMonitor {
           if (analysis.type === "swap") swapTxs.add(tx.hash);
           if (analysis.type === "transfer") transferTxs.add(tx.hash);
           transactionDetails[tx.hash] = analysis;
+          this.log("debug", "Analyzed transaction", {
+            txHash: tx.hash,
+            type: analysis.type,
+            protocol: analysis.protocol || "unknown",
+          });
         }
 
         predictedTxs.push(tx.hash);
@@ -635,6 +706,12 @@ export class MempoolMonitor {
     transactionDetails: { [txHash: string]: any }
   ) {
     try {
+      this.log("debug", "Attempting to store prediction", {
+        blockNumber,
+        txCount: txs.length,
+        avgGasPrice: avgGasPrice.toString(),
+      });
+
       // Convert parameters that might contain BigInt to regular numbers
       const processedDetails = Object.fromEntries(
         Object.entries(transactionDetails).map(([hash, details]) => [
@@ -654,13 +731,21 @@ export class MempoolMonitor {
       prediction.predictedGasPrice = Number(avgGasPrice) / 1e9; // Convert to Gwei
       prediction.transactionDetails = processedDetails;
 
-      await this.db.getRepository(BlockPrediction).save(prediction);
-      this.log(
-        "debug",
-        `Stored prediction for block ${blockNumber} with ${txs.length} transactions`
-      );
+      const savedPrediction = await this.db
+        .getRepository(BlockPrediction)
+        .save(prediction);
+      this.log("info", `Stored prediction for block ${blockNumber}`, {
+        blockNumber,
+        txCount: txs.length,
+        id: savedPrediction.id,
+        details: Object.keys(processedDetails).length,
+      });
     } catch (error) {
-      this.log("error", "Error storing prediction:", { error });
+      this.log("error", "Error storing prediction:", {
+        error: error instanceof Error ? error.message : String(error),
+        blockNumber,
+        txCount: txs.length,
+      });
     }
   }
 
