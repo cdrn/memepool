@@ -1,60 +1,44 @@
-# MemePool - Ethereum Mempool Analysis Service
+# MemePool
 
-A service for monitoring Ethereum's mempool, predicting block contents, and analyzing block production.
+Real-time Ethereum mempool analysis and block prediction.
 
-## Components
+## Overview
 
-- `node/`: Ethereum node configuration and setup
-- `backend/`: Main service for mempool monitoring and analysis
-  - Mempool monitoring
-  - Transaction prediction
-  - Block comparison
-  - Database integration
-- `frontend/`: Web interface for visualization
-  - Real-time mempool status
-  - Block predictions vs. reality
-  - Historical analysis
-
-## Prerequisites
-
-- Docker & Docker Compose
-- Node.js >= 16
-- Go >= 1.19 (for Geth)
-- PostgreSQL >= 14
+- Monitors pending transactions in the Ethereum mempool
+- Predicts block contents using gas price and transaction type analysis
+- Analyzes transaction patterns and protocols
+- Visualizes mempool activity and prediction accuracy
 
 ## Setup
 
-1. Start the Ethereum node:
+1. Start Ethereum node:
 ```bash
-cd node
-docker-compose up -d
+cd node && docker-compose up -d
 ```
 
-2. Start the backend service:
+2. Start backend:
 ```bash
 cd backend
 npm install
-npm run start
+npm run dev
 ```
 
-3. Start the frontend:
+3. Start frontend:
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
 
+## Configuration
+
+- Configure Ethereum node connection in `backend/.env`
+- PostgreSQL required for data storage
+- See `backend/.env.example` for required environment variables
+
 ## Architecture
 
-The system consists of three main components:
-1. An Ethereum full node that syncs with the network
-2. A backend service that:
-   - Monitors the mempool
-   - Predicts next block contents
-   - Compares predictions with reality
-   - Stores data in PostgreSQL
-3. A frontend that visualizes the data
-
-## Development Status
-
-🚧 Under Construction 🚧
+- Ethereum full node for mempool access
+- Backend for analysis and predictions
+- Frontend for data visualization
+- PostgreSQL for data persistence
