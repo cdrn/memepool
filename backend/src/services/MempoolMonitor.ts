@@ -1,45 +1,14 @@
 import { ethers } from "ethers";
-import { Logger } from "winston";
 import { DataSource } from "typeorm";
 import { BlockPrediction } from "../entities/BlockPrediction";
 import { BlockComparison } from "../entities/BlockComparison";
 import { ProtocolAnalyzer } from "./ProtocolAnalyzer";
+import { createComponentLogger, type LogContext } from "../utils/logger";
 import pLimit from "p-limit";
-
-interface LogContext {
-  blockNumber?: number;
-  txHash?: string;
-  error?: any;
-  requestId?: string;
-  txCount?: number;
-  gasLimit?: string;
-  avgGasPrice?: string;
-  gasUsed?: string;
-  component?: string;
-  wsUrl?: string;
-  baseFee?: string;
-  to?: string;
-  value?: string;
-  gasPrice?: string;
-  predictedTxCount?: number;
-  id?: number;
-  details?: number;
-  pendingTxCount?: number;
-  groupCount?: number;
-  totalTxs?: number;
-  maxFee?: string;
-  nextBaseFee?: string;
-  priorityFee?: string;
-  groupSize?: number;
-  totalGasUsed?: string;
-  targetGasUsed?: string;
-  type?: string;
-  protocol?: string;
-}
 
 export class MempoolMonitor {
   private provider: ethers.WebSocketProvider;
-  private logger: Logger;
+  private logger: ReturnType<typeof createComponentLogger>;
   private db: DataSource;
   private pendingTransactions: Map<string, ethers.TransactionResponse> =
     new Map();
@@ -55,21 +24,24 @@ export class MempoolMonitor {
   private analysisCache: Map<string, any> = new Map();
   private lastAnalysisTime: Map<string, number> = new Map();
 
-  constructor(wsUrl: string, logger: Logger, db: DataSource) {
+  constructor(wsUrl: string, db: DataSource) {
     this.wsUrl = wsUrl;
-    this.logger = logger;
+    this.logger = createComponentLogger("MempoolMonitor");
     this.db = db;
     this.provider = new ethers.WebSocketProvider(wsUrl);
-    this.protocolAnalyzer = new ProtocolAnalyzer(this.provider, logger, db);
+    this.protocolAnalyzer = new ProtocolAnalyzer(this.provider, db);
   }
 
-  private log(level: string, message: string, context: LogContext = {}) {
+  private log(
+    level: "debug" | "info" | "warn" | "error",
+    message: string,
+    context: LogContext = {}
+  ) {
     const requestId = context.requestId || `req_${++this.requestCount}`;
-    this.logger.log(level, message, {
+    this.logger[level](message, {
       ...context,
       requestId,
       timestamp: new Date().toISOString(),
-      component: "MempoolMonitor",
     });
   }
 
@@ -89,11 +61,111 @@ export class MempoolMonitor {
         wsUrl: this.wsUrl,
       });
 
+      // Subscribe to new blocks first
+      await (this.provider as any).send("eth_subscribe", ["newHeads"]);
+      this.log("info", "Subscribed to new blocks");
+
       // Subscribe to pending transactions
       await (this.provider as any).send("eth_subscribe", [
         "newPendingTransactions",
       ]);
       this.log("info", "Subscribed to pending transactions");
+
+      let processingBlock = false;
+      let lastProcessedBlock = blockNumber;
+
+      // Monitor new blocks with throttling
+      this.provider.on("block", async (blockNumber: number) => {
+        this.log("info", "New block received", {
+          blockNumber,
+          lastProcessedBlock,
+        });
+
+        // Ensure we process blocks in sequence
+        if (blockNumber <= lastProcessedBlock) {
+          this.log("debug", "Skipping old block", {
+            blockNumber,
+            lastProcessedBlock,
+          });
+          return;
+        }
+
+        // If we missed some blocks, process them first
+        if (blockNumber > lastProcessedBlock + 1) {
+          this.log("warn", "Missed blocks detected", {
+            current: blockNumber,
+            last: lastProcessedBlock,
+            missed: blockNumber - lastProcessedBlock - 1,
+          });
+
+          // Process missed blocks in sequence
+          for (
+            let missedBlock = lastProcessedBlock + 1;
+            missedBlock < blockNumber;
+            missedBlock++
+          ) {
+            try {
+              const block = await this.provider.getBlock(missedBlock, true);
+              if (block) {
+                await this.handleNewBlock(block);
+              }
+            } catch (error) {
+              this.log("error", "Failed to process missed block", {
+                blockNumber: missedBlock,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+          }
+        }
+
+        if (processingBlock) {
+          this.log("debug", "Already processing a block, skipping", {
+            blockNumber,
+          });
+          return;
+        }
+
+        processingBlock = true;
+        try {
+          await this.requestLimiter(async () => {
+            const block = await this.provider.getBlock(blockNumber, true);
+            if (!block) {
+              this.log("warn", "Failed to fetch block details", {
+                blockNumber,
+              });
+              return;
+            }
+
+            this.lastBlockGasLimit = block.gasLimit;
+            this.lastBaseFee = block.baseFeePerGas || BigInt(0);
+            await this.handleNewBlock(block);
+            lastProcessedBlock = blockNumber;
+
+            this.log("debug", "Block processing complete", {
+              blockNumber,
+              gasLimit: block.gasLimit.toString(),
+              baseFee: (block.baseFeePerGas || BigInt(0)).toString(),
+              pendingTxs: this.pendingTransactions.size,
+            });
+          });
+        } catch (error) {
+          if (this.isRateLimitError(error)) {
+            this.log("warn", "Rate limit hit while processing block", {
+              blockNumber,
+              error: error instanceof Error ? error.message : String(error),
+              pendingTxs: this.pendingTransactions.size,
+            });
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          } else {
+            this.log("error", "Failed to process block", {
+              blockNumber,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        } finally {
+          processingBlock = false;
+        }
+      });
 
       // Monitor new pending transactions with throttling
       this.provider.on("pending", async (txHash: string) => {
@@ -128,42 +200,6 @@ export class MempoolMonitor {
           }
         }
       });
-
-      // Monitor new blocks with throttling
-      this.provider.on("block", async (blockNumber: number) => {
-        this.log("info", "New block received", { blockNumber });
-        try {
-          await this.requestLimiter(async () => {
-            const block = await this.provider.getBlock(blockNumber, true);
-            if (block) {
-              this.lastBlockGasLimit = block.gasLimit;
-              this.lastBaseFee = block.baseFeePerGas || BigInt(0);
-              await this.compareWithPrediction(block);
-              await this.cleanupOldTransactions(block);
-              await this.predictNextBlock();
-              this.log("info", "Processed new block", {
-                blockNumber,
-                txCount: block.transactions.length,
-                gasLimit: block.gasLimit.toString(),
-                baseFee: (block.baseFeePerGas || BigInt(0)).toString(),
-                predictedTxCount: this.pendingTransactions.size,
-              });
-            }
-          });
-        } catch (error) {
-          if (this.isRateLimitError(error)) {
-            this.log("warn", "Rate limit hit while processing block", {
-              blockNumber,
-            });
-            await new Promise((resolve) => setTimeout(resolve, 1000));
-          } else {
-            this.log("error", "Failed to process block", {
-              blockNumber,
-              error: error instanceof Error ? error.message : String(error),
-            });
-          }
-        }
-      });
     } catch (error) {
       this.log("error", "Failed to setup WebSocket connection", {
         error: error instanceof Error ? error.message : String(error),
@@ -178,23 +214,33 @@ export class MempoolMonitor {
 
     this.isReconnecting = true;
     try {
+      this.log(
+        "warn",
+        "WebSocket connection lost, attempting to reconnect in 5 seconds"
+      );
       await new Promise((resolve) => setTimeout(resolve, 5000));
-      this.log("info", "Attempting to reconnect WebSocket");
 
       this.provider.removeAllListeners();
       await this.provider.destroy();
 
       this.provider = new ethers.WebSocketProvider(this.wsUrl);
-      this.protocolAnalyzer = new ProtocolAnalyzer(
-        this.provider,
-        this.logger,
-        this.db
-      );
+      this.protocolAnalyzer = new ProtocolAnalyzer(this.provider, this.db);
 
+      // Clear existing state
+      this.pendingTransactions.clear();
+      this.blockPredictions.clear();
+      this.analysisCache.clear();
+      this.lastAnalysisTime.clear();
+      this.baseFeeTrend = [];
+
+      // Re-initialize connection and subscriptions
       await this.setupWebSocket();
       this.log("info", "Successfully reconnected WebSocket");
     } catch (error) {
-      this.log("error", "Failed to reconnect WebSocket", { error });
+      this.log("error", "Failed to reconnect WebSocket", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // Try again in 10 seconds
       setTimeout(() => this.handleWebSocketError(), 10000);
     } finally {
       this.isReconnecting = false;
@@ -203,6 +249,12 @@ export class MempoolMonitor {
 
   private async handleNewBlock(block: ethers.Block) {
     try {
+      this.log("debug", "Processing new block", {
+        blockNumber: block.number,
+        txCount: block.transactions.length,
+        baseFee: block.baseFeePerGas?.toString() || "0",
+      });
+
       // Update base fee tracking
       if (block.baseFeePerGas) {
         this.lastBaseFee = block.baseFeePerGas;
@@ -218,11 +270,31 @@ export class MempoolMonitor {
         this.lastBlockGasLimit = block.gasLimit;
       }
 
+      // First compare with our prediction for this block
       await this.compareWithPrediction(block);
+
+      // Then clean up old transactions that made it into this block
       await this.cleanupOldTransactions(block);
-      await this.predictNextBlock();
+
+      // Finally make a prediction for the next block
+      const nextBlockNumber = block.number + 1;
+      // Only predict if we haven't already predicted this block
+      if (!this.blockPredictions.has(nextBlockNumber)) {
+        await this.predictNextBlock();
+      }
+
+      this.log("info", "Successfully processed block", {
+        blockNumber: block.number,
+        txCount: block.transactions.length,
+        baseFee: block.baseFeePerGas?.toString() || "0",
+        pendingTxs: this.pendingTransactions.size,
+        predictionsInMemory: Array.from(this.blockPredictions.keys()).join(","),
+      });
     } catch (error) {
-      this.log("error", "Error handling new block", { error });
+      this.log("error", "Error handling new block", {
+        blockNumber: block.number,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -262,8 +334,9 @@ export class MempoolMonitor {
     const txsByPriority = new Map<bigint, ethers.TransactionResponse[]>();
 
     for (const tx of pendingTxs) {
-      if (tx.maxFeePerGas && tx.maxFeePerGas < nextBaseFee) {
-        this.log("debug", "Skipping transaction due to low max fee", {
+      // Only skip transactions that are clearly not going to make it
+      if (tx.maxFeePerGas && tx.maxFeePerGas < nextBaseFee / BigInt(2)) {
+        this.log("debug", "Skipping transaction due to very low max fee", {
           txHash: tx.hash,
           maxFee: tx.maxFeePerGas.toString(),
           nextBaseFee: nextBaseFee.toString(),
@@ -291,22 +364,21 @@ export class MempoolMonitor {
     const predictedTxs: string[] = [];
     let totalGasUsed = BigInt(0);
     const gasLimit = this.lastBlockGasLimit;
-    const targetGasUsed = (gasLimit * BigInt(85)) / BigInt(100);
+    // Increase target gas used to 95% of limit
+    const targetGasUsed = (gasLimit * BigInt(95)) / BigInt(100);
 
     const transactionDetails: Record<string, any> = {};
-    const swapTxs = new Set<string>();
-    const transferTxs = new Set<string>();
 
-    // Process transactions in priority order with rate limiting and caching
+    // Process transactions in priority order
     for (const [priorityFee, txGroup] of sortedGroups) {
-      this.log("debug", "Processing transaction group", {
-        priorityFee: priorityFee.toString(),
-        groupSize: txGroup.length,
-      });
-
       for (const tx of txGroup) {
         const txGasLimit = tx.gasLimit || BigInt(0);
-        if (totalGasUsed + txGasLimit > targetGasUsed) {
+
+        // Be more lenient with gas limit
+        if (
+          totalGasUsed + txGasLimit >
+          (targetGasUsed * BigInt(12)) / BigInt(10)
+        ) {
           this.log("debug", "Block gas limit reached", {
             totalGasUsed: totalGasUsed.toString(),
             targetGasUsed: targetGasUsed.toString(),
@@ -314,125 +386,94 @@ export class MempoolMonitor {
           continue;
         }
 
-        let analysis;
-        // Check cache first
-        if (this.analysisCache.has(tx.hash)) {
-          analysis = this.analysisCache.get(tx.hash);
-        } else {
-          try {
-            // Rate limited analysis
-            analysis = await this.requestLimiter(async () => {
-              const result = await this.protocolAnalyzer.analyzeTransaction(tx);
-              if (result) {
-                this.analysisCache.set(tx.hash, result);
-                this.lastAnalysisTime.set(tx.hash, Date.now());
-              }
-              return result;
-            });
-          } catch (error) {
-            if (this.isRateLimitError(error)) {
-              this.log("warn", "Rate limit hit, skipping analysis", {
-                txHash: tx.hash,
-              });
-              continue;
+        try {
+          // Analyze transaction
+          const analysis = await this.requestLimiter(async () => {
+            if (this.analysisCache.has(tx.hash)) {
+              return this.analysisCache.get(tx.hash);
             }
-            throw error;
-          }
-        }
-
-        if (analysis) {
-          if (analysis.type === "swap") swapTxs.add(tx.hash);
-          if (analysis.type === "transfer") transferTxs.add(tx.hash);
-          transactionDetails[tx.hash] = analysis;
-          this.log("debug", "Analyzed transaction", {
-            txHash: tx.hash,
-            type: analysis.type,
-            protocol: analysis.protocol || "unknown",
+            const result = await this.protocolAnalyzer.analyzeTransaction(tx);
+            if (result) {
+              this.analysisCache.set(tx.hash, result);
+              this.lastAnalysisTime.set(tx.hash, Date.now());
+            }
+            return result;
           });
-        }
 
-        predictedTxs.push(tx.hash);
-        totalGasUsed += txGasLimit;
+          if (analysis) {
+            transactionDetails[tx.hash] = analysis;
+          }
+
+          predictedTxs.push(tx.hash);
+          totalGasUsed += txGasLimit;
+        } catch (error) {
+          if (this.isRateLimitError(error)) {
+            this.log("warn", "Rate limit hit while analyzing transaction", {
+              txHash: tx.hash,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            continue;
+          }
+          throw error;
+        }
 
         if (totalGasUsed >= targetGasUsed) break;
       }
       if (totalGasUsed >= targetGasUsed) break;
     }
 
-    // Clean up old cache entries (older than 1 hour)
-    const now = Date.now();
-    for (const [hash, time] of this.lastAnalysisTime.entries()) {
-      if (now - time > 3600000) {
-        this.analysisCache.delete(hash);
-        this.lastAnalysisTime.delete(hash);
-      }
-    }
-
-    // Look for sandwich opportunities
-    if (swapTxs.size > 0) {
-      const sandwichPairs = this.findSandwichOpportunities(
-        Array.from(swapTxs).map((hash) => this.pendingTransactions.get(hash)!)
-      );
-      // Prioritize sandwich transactions
-      sandwichPairs.forEach((pair) => {
-        if (!predictedTxs.includes(pair.frontrun.hash)) {
-          predictedTxs.unshift(pair.frontrun.hash);
-          transactionDetails[pair.frontrun.hash] = {
-            ...transactionDetails[pair.frontrun.hash],
-            type: "sandwich",
-            isSandwichTarget: false,
-          };
-        }
-        if (!predictedTxs.includes(pair.target.hash)) {
-          const targetIndex = predictedTxs.findIndex(
-            (hash) =>
-              this.getEffectivePriorityFee(
-                this.pendingTransactions.get(hash)!
-              ) < this.getEffectivePriorityFee(pair.target)
-          );
-          predictedTxs.splice(targetIndex, 0, pair.target.hash);
-          transactionDetails[pair.target.hash] = {
-            ...transactionDetails[pair.target.hash],
-            type: "sandwich",
-            isSandwichTarget: true,
-          };
-        }
-        if (!predictedTxs.includes(pair.backrun.hash)) {
-          predictedTxs.push(pair.backrun.hash);
-          transactionDetails[pair.backrun.hash] = {
-            ...transactionDetails[pair.backrun.hash],
-            type: "sandwich",
-            isSandwichTarget: false,
-          };
-        }
-      });
-    }
-
     const nextBlockNumber = (await this.provider.getBlockNumber()) + 1;
-    this.blockPredictions.set(nextBlockNumber, predictedTxs);
 
-    const avgGasPrice =
-      predictedTxs.length > 0
-        ? predictedTxs.reduce((sum: bigint, hash: string) => {
-            const tx = this.pendingTransactions.get(hash);
-            return sum + (tx ? this.getEffectivePriorityFee(tx) : BigInt(0));
-          }, BigInt(0)) / BigInt(predictedTxs.length)
-        : BigInt(0);
+    try {
+      const prediction = new BlockPrediction();
+      prediction.blockNumber = nextBlockNumber;
+      prediction.predictedTransactions = predictedTxs;
+      prediction.predictedGasPrice =
+        Number(
+          predictedTxs.length > 0
+            ? predictedTxs.reduce((sum: bigint, hash: string) => {
+                const tx = this.pendingTransactions.get(hash);
+                return (
+                  sum + (tx ? this.getEffectivePriorityFee(tx) : BigInt(0))
+                );
+              }, BigInt(0)) / BigInt(predictedTxs.length)
+            : BigInt(0)
+        ) / 1e9; // Convert to Gwei
+      prediction.transactionDetails = Object.fromEntries(
+        Object.entries(transactionDetails).map(([hash, details]) => [
+          hash,
+          {
+            ...details,
+            params: details.params
+              ? this.convertBigIntToString(details.params)
+              : undefined,
+          },
+        ])
+      );
 
-    await this.storePrediction(
-      nextBlockNumber,
-      predictedTxs,
-      avgGasPrice,
-      transactionDetails
-    );
+      const savedPrediction = await this.db
+        .getRepository(BlockPrediction)
+        .save(prediction);
+      this.blockPredictions.set(nextBlockNumber, predictedTxs);
 
-    this.log("debug", "Generated block prediction", {
-      blockNumber: nextBlockNumber,
-      txCount: predictedTxs.length,
-      avgGasPrice: avgGasPrice.toString(),
-      gasUsed: totalGasUsed.toString(),
-      gasLimit: gasLimit.toString(),
-    });
+      this.log("info", "Successfully stored block prediction", {
+        blockNumber: nextBlockNumber,
+        id: savedPrediction.id,
+        txCount: predictedTxs.length,
+        gasUsed: totalGasUsed.toString(),
+        gasLimit: gasLimit.toString(),
+        detailsCount: Object.keys(transactionDetails).length,
+      });
+    } catch (error) {
+      this.log("error", "Failed to store block prediction", {
+        blockNumber: nextBlockNumber,
+        error: error instanceof Error ? error.message : String(error),
+        txCount: predictedTxs.length,
+      });
+      // Don't set blockPredictions if storage failed
+      return;
+    }
   }
 
   private estimateNextBaseFee(): bigint {
@@ -602,7 +643,15 @@ export class MempoolMonitor {
 
   private async compareWithPrediction(block: ethers.Block) {
     const prediction = this.blockPredictions.get(block.number);
-    if (!prediction) return;
+    if (!prediction) {
+      this.log("debug", "No prediction found for block", {
+        blockNumber: block.number,
+        availablePredictions: Array.from(this.blockPredictions.keys()).join(
+          ","
+        ),
+      });
+      return;
+    }
 
     const actualTxs = block.transactions
       .map((tx: string | ethers.TransactionResponse) =>
@@ -610,18 +659,43 @@ export class MempoolMonitor {
       )
       .filter((hash): hash is string => hash !== null);
 
-    const comparison = {
+    const accuracy = this.calculateAccuracy(prediction, actualTxs);
+    this.log("info", "Block comparison results", {
       blockNumber: block.number,
-      predictedTxs: prediction,
-      actualTxs,
-      accuracy: this.calculateAccuracy(prediction, actualTxs),
-      miner: block.miner,
-      timestamp: new Date(),
-    };
+      predictedTxs: prediction.length,
+      actualTxs: actualTxs.length,
+      accuracy,
+    });
 
-    // Store comparison in database
-    await this.storeComparison(comparison);
-    this.blockPredictions.delete(block.number);
+    try {
+      // Store comparison in database
+      const blockComparison = new BlockComparison();
+      blockComparison.blockNumber = block.number;
+      blockComparison.predictedTransactions = prediction;
+      blockComparison.actualTransactions = actualTxs;
+      blockComparison.accuracy = accuracy;
+      blockComparison.miner = block.miner;
+      blockComparison.timestamp = new Date();
+
+      const savedComparison = await this.db
+        .getRepository(BlockComparison)
+        .save(blockComparison);
+      this.log("info", "Successfully stored block comparison", {
+        blockNumber: block.number,
+        id: savedComparison.id,
+        predictedCount: prediction.length,
+        actualCount: actualTxs.length,
+        accuracy,
+      });
+
+      // Remove this prediction since we've processed it
+      this.blockPredictions.delete(block.number);
+    } catch (error) {
+      this.log("error", "Failed to store block comparison", {
+        blockNumber: block.number,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private async cleanupOldTransactions(block: ethers.Block) {
@@ -710,6 +784,7 @@ export class MempoolMonitor {
         blockNumber,
         txCount: txs.length,
         avgGasPrice: avgGasPrice.toString(),
+        detailsCount: Object.keys(transactionDetails).length,
       });
 
       // Convert parameters that might contain BigInt to regular numbers
@@ -734,18 +809,19 @@ export class MempoolMonitor {
       const savedPrediction = await this.db
         .getRepository(BlockPrediction)
         .save(prediction);
-      this.log("info", `Stored prediction for block ${blockNumber}`, {
+      this.log("info", "Successfully stored prediction", {
         blockNumber,
         txCount: txs.length,
         id: savedPrediction.id,
-        details: Object.keys(processedDetails).length,
+        detailsCount: Object.keys(processedDetails).length,
       });
     } catch (error) {
-      this.log("error", "Error storing prediction:", {
+      this.log("error", "Error storing prediction", {
         error: error instanceof Error ? error.message : String(error),
         blockNumber,
         txCount: txs.length,
       });
+      throw error; // Re-throw to handle at caller
     }
   }
 
