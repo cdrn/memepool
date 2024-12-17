@@ -3,33 +3,38 @@ import {
   PrimaryGeneratedColumn,
   Column,
   CreateDateColumn,
+  ManyToOne,
+  Index,
 } from "typeorm";
-import type { BlockPrediction as IBlockPrediction } from "@shared/types";
+import { Block } from "./Block";
 
 @Entity()
-export class BlockPrediction implements IBlockPrediction {
+export class BlockPrediction {
   @PrimaryGeneratedColumn()
   id!: number;
 
   @Column()
+  @Index()
   blockNumber!: number;
 
-  @Column("text", { array: true })
+  @ManyToOne(() => Block, (block) => block.predictions, { nullable: true })
+  block?: Block;
+
+  @Column("simple-array")
   predictedTransactions!: string[];
 
-  @Column("float")
-  predictedGasPrice!: number;
+  @Column("numeric", { precision: 20, scale: 9 })
+  predictedGasPrice!: string;
+
+  @Column("jsonb")
+  transactionDetails!: Record<string, any>;
 
   @CreateDateColumn()
   createdAt!: Date;
 
+  @Column("float", { nullable: true })
+  accuracy?: number;
+
   @Column("jsonb", { nullable: true })
-  transactionDetails: {
-    [txHash: string]: {
-      protocol?: string;
-      methodName?: string;
-      params?: any;
-      isSandwichTarget?: boolean;
-    };
-  } = {};
+  metadata?: Record<string, any>;
 }

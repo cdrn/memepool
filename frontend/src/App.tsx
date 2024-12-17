@@ -49,6 +49,7 @@ function App() {
   useEffect(() => {
     const fetchData = async () => {
       try {
+        setLoading(true);
         const [predictionsRes, comparisonsRes] = await Promise.all([
           fetch("http://localhost:3001/api/predictions"),
           fetch("http://localhost:3001/api/comparisons"),
@@ -75,10 +76,17 @@ function App() {
       }
     };
 
+    // Initial fetch
     fetchData();
-    const interval = setInterval(fetchData, 10000);
-    return () => clearInterval(interval);
-  }, []);
+
+    // Set up polling interval
+    const pollInterval = setInterval(fetchData, 5000); // Poll every 5 seconds
+
+    // Cleanup function
+    return () => {
+      clearInterval(pollInterval);
+    };
+  }, []); // Empty dependency array means this effect runs once on mount
 
   const latestComparison = comparisons[0];
   const averageAccuracy =
@@ -249,8 +257,7 @@ function App() {
             Ethereum Mempool Monitor
           </h1>
           <p className="text-gray-600 dark:text-gray-400 text-lg max-w-2xl mx-auto">
-            Analyzing transaction flow and predicting block contents in
-            real-time
+            Shining a light on the dark forest
           </p>
         </header>
 
@@ -311,6 +318,9 @@ function App() {
                     Miner
                   </th>
                   <th className="py-4 text-left font-medium text-gray-600 dark:text-gray-400">
+                    Builder
+                  </th>
+                  <th className="py-4 text-left font-medium text-gray-600 dark:text-gray-400">
                     Accuracy
                   </th>
                   <th className="py-4 text-left font-medium text-gray-600 dark:text-gray-400">
@@ -332,7 +342,32 @@ function App() {
                       #{comparison.blockNumber}
                     </td>
                     <td className="py-4 font-mono text-sm text-gray-600 dark:text-gray-400">
-                      {comparison.miner.slice(0, 10)}...
+                      <span title={comparison.miner}>
+                        {comparison.miner.slice(0, 10)}...
+                      </span>
+                    </td>
+                    <td className="py-4 font-mono text-sm">
+                      <span
+                        title={comparison.builder || "Unknown"}
+                        className={`px-2 py-1 rounded ${
+                          comparison.builderName === "builder0x69"
+                            ? "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200"
+                            : comparison.builderName === "titan"
+                            ? "bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200"
+                            : comparison.builderName === "beaverbuild"
+                            ? "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200"
+                            : comparison.builderName === "flashbots"
+                            ? "bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200"
+                            : comparison.builderName === "rsync"
+                            ? "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200"
+                            : "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400"
+                        }`}
+                      >
+                        {comparison.builderName ||
+                          (comparison.builder
+                            ? `${comparison.builder.slice(0, 10)}...`
+                            : "unknown")}
+                      </span>
                     </td>
                     <td className="py-4">
                       <span

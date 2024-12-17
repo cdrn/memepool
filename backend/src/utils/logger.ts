@@ -1,78 +1,15 @@
-import { createLogger, format, transports } from "winston";
+import {
+  createLogger as winstonCreateLogger,
+  format,
+  transports,
+} from "winston";
 
 interface LogContext {
-  // Block-related
-  blockNumber?: number;
-  lastProcessedBlock?: number;
-  current?: number;
-  last?: number;
-  missed?: number;
-  latestBlock?: number;
-  oldestBlock?: number;
-
-  // Transaction-related
-  txHash?: string;
-  txCount?: number;
-  count?: number;
-  totalCount?: number;
-  predictedCount?: number;
-  actualCount?: number;
-  pendingTxCount?: number;
-  pendingTxs?: number;
-  processedTxs?: number;
-  predictedTxs?: number;
-  actualTxs?: number;
-
-  // Gas-related
-  gasLimit?: string;
-  gasUsed?: string;
-  totalGasUsed?: string;
-  targetGasUsed?: string;
-  avgGasPrice?: string;
-  gasPrice?: string;
-  maxFee?: string;
-  baseFee?: string;
-  nextBaseFee?: string;
-  priorityFee?: string;
-
-  // Transaction details
-  to?: string;
-  value?: string;
-  type?: string;
-  protocol?: string;
-  detailsCount?: number;
-  details?: number;
-
-  // Analysis-related
-  groupCount?: number;
-  totalTxs?: number;
-  groupSize?: number;
-  accuracy?: number;
-  accuracies?: number[];
-  samplePrediction?: any;
-  sampleComparison?: any;
-
-  // Metadata
-  id?: number;
-  requestId?: string;
-  component?: string;
-  wsUrl?: string;
-  error?: any;
-  message?: string;
-  time?: number;
-  timestamp?: string;
-
-  // Database-related
-  query?: string;
-  parameters?: any[];
-
-  // Prediction tracking
-  predictedTxCount?: number;
-  predictionsInMemory?: string;
-  availablePredictions?: string;
+  // Allow any properties
+  [key: string]: any;
 }
 
-export const logger = createLogger({
+export const logger = winstonCreateLogger({
   format: format.combine(
     format.timestamp(),
     format.colorize(),
@@ -150,3 +87,6 @@ export function createComponentLogger(component: string) {
     },
   };
 }
+
+// Export the createLogger function as an alias of createComponentLogger
+export const createLogger = createComponentLogger;

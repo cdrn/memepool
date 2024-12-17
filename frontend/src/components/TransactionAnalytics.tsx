@@ -13,8 +13,8 @@ interface TreemapData {
   children?: TreemapData[];
   color?: string;
   rawData?: {
-    protocol: string;
-    type: string;
+    token: string;
+    symbol: string;
     txCount: number;
     totalValue: number;
     gasValue: number;
@@ -22,25 +22,23 @@ interface TreemapData {
   };
 }
 
-// Brighter color scheme for better visibility
-const PROTOCOL_COLORS = {
-  "Uniswap V2": "#FE007A",
-  "Uniswap V3": "#FF1493",
-  SushiSwap: "#FF69B4",
-  "1inch": "#4169E1",
-  Balancer: "#40E0D0",
-  Curve: "#00CED1",
-  AAVE: "#DA70D6",
-  Compound: "#32CD32",
-  Chainlink: "#1E90FF",
-  DEX: "#FF69B4",
-  "Liquidity Pool": "#9370DB",
-  Bridge: "#FFA500",
-  Vault: "#20B2AA",
-  "Lending Protocol": "#BA55D3",
-  Oracle: "#4682B4",
-  "Token Contract": "#778899",
-  unknown: "#A9A9A9",
+// Color scheme for different token types
+const TOKEN_COLORS = {
+  ETH: "#627EEA", // Ethereum blue
+  WETH: "#627EEA", // Same as ETH
+  USDC: "#2775CA", // USDC blue
+  USDT: "#26A17B", // Tether green
+  DAI: "#F5AC37", // DAI gold
+  WBTC: "#F7931A", // Bitcoin orange
+  UNI: "#FF007A", // Uniswap pink
+  LINK: "#2A5ADA", // Chainlink blue
+  AAVE: "#B6509E", // AAVE purple
+  COMP: "#00D395", // Compound green
+  MKR: "#1AAB9B", // Maker green
+  SNX: "#00D1FF", // Synthetix blue
+  YFI: "#006AE3", // Yearn blue
+  SUSHI: "#FA52A0", // Sushiswap pink
+  unknown: "#A9A9A9", // Gray for unknown tokens
 };
 
 export function TransactionAnalytics({
@@ -53,13 +51,15 @@ export function TransactionAnalytics({
     const latestPrediction = predictions[0];
     console.log("Processing block:", latestPrediction.blockNumber);
 
-    // Group transactions by protocol and type
-    const protocolGroups: {
+    // Group transactions by token
+    const tokenGroups: {
       [key: string]: {
-        types: { [key: string]: number };
+        symbol: string;
         txCount: number;
+        totalValue: number;
         gasValue: number;
         methodNames: Set<string>;
+        protocols: Set<string>;
       };
     } = {};
 
@@ -88,32 +88,28 @@ export function TransactionAnalytics({
 
       totalBlockValue += totalValue;
 
+      // Get token information from the transaction details
+      const token = details.token || "ETH";
+      const symbol = details.tokenSymbol || token;
       const protocol = details.protocol || "unknown";
-      const type = details.type || "unknown";
-      const category = details.category || "unknown";
       const methodName = details.methodName || "unknown";
 
-      // Create a more descriptive transaction type
-      let displayType = type;
-      if (type === "transfer" && category) {
-        displayType = `${category} ${type}`;
-      }
-
-      if (!protocolGroups[protocol]) {
-        protocolGroups[protocol] = {
-          types: {},
+      if (!tokenGroups[token]) {
+        tokenGroups[token] = {
+          symbol,
           txCount: 0,
+          totalValue: 0,
           gasValue: 0,
           methodNames: new Set(),
+          protocols: new Set(),
         };
       }
-      if (!protocolGroups[protocol].types[displayType]) {
-        protocolGroups[protocol].types[displayType] = 0;
-      }
-      protocolGroups[protocol].types[displayType] += totalValue;
-      protocolGroups[protocol].txCount += 1;
-      protocolGroups[protocol].gasValue += gasValue;
-      if (methodName) protocolGroups[protocol].methodNames.add(methodName);
+
+      tokenGroups[token].totalValue += totalValue;
+      tokenGroups[token].txCount += 1;
+      tokenGroups[token].gasValue += gasValue;
+      if (methodName) tokenGroups[token].methodNames.add(methodName);
+      if (protocol) tokenGroups[token].protocols.add(protocol);
     });
 
     // Convert to treemap format
@@ -123,65 +119,41 @@ export function TransactionAnalytics({
       children: [],
     };
 
-    // Sort protocols by total value
-    const sortedProtocols = Object.entries(protocolGroups)
-      .map(([protocol, data]) => ({
-        protocol,
-        totalValue: Object.values(data.types).reduce(
-          (sum, value) => sum + value,
-          0
-        ),
-        types: data.types,
+    // Sort tokens by total value
+    const sortedTokens = Object.entries(tokenGroups)
+      .map(([token, data]) => ({
+        token,
+        symbol: data.symbol,
+        totalValue: data.totalValue,
         txCount: data.txCount,
         gasValue: data.gasValue,
         methodNames: data.methodNames,
+        protocols: data.protocols,
       }))
       .sort((a, b) => b.totalValue - a.totalValue);
 
-    sortedProtocols.forEach((protocolData) => {
-      // Skip protocols with less than 0.1% of total block value
-      if (protocolData.totalValue / totalBlockValue < 0.001) return;
+    sortedTokens.forEach((tokenData) => {
+      // Skip tokens with less than 0.1% of total block value
+      if (tokenData.totalValue / totalBlockValue < 0.001) return;
 
-      const protocolNode: TreemapData = {
-        id: protocolData.protocol,
-        value: 0,
-        children: [],
+      const tokenNode: TreemapData = {
+        id: tokenData.token,
+        value: tokenData.totalValue,
         color:
-          PROTOCOL_COLORS[
-            protocolData.protocol as keyof typeof PROTOCOL_COLORS
-          ] || PROTOCOL_COLORS.unknown,
+          TOKEN_COLORS[tokenData.symbol as keyof typeof TOKEN_COLORS] ||
+          TOKEN_COLORS.unknown,
         rawData: {
-          protocol: protocolData.protocol,
-          type: "protocol",
-          txCount: protocolData.txCount,
-          totalValue: protocolData.totalValue,
-          gasValue: protocolData.gasValue,
-          methodNames: protocolData.methodNames,
+          token: tokenData.token,
+          symbol: tokenData.symbol,
+          txCount: tokenData.txCount,
+          totalValue: tokenData.totalValue,
+          gasValue: tokenData.gasValue,
+          methodNames: tokenData.methodNames,
         },
       };
 
-      // Sort types by value
-      Object.entries(protocolData.types)
-        .sort(([, a], [, b]) => b - a)
-        .forEach(([type, value]) => {
-          protocolNode.children?.push({
-            id: `${protocolData.protocol} - ${type}`,
-            value: value,
-            rawData: {
-              protocol: protocolData.protocol,
-              type: type,
-              txCount: 1, // This is approximate
-              totalValue: value,
-              gasValue:
-                protocolData.gasValue / Object.keys(protocolData.types).length, // Approximate
-              methodNames: protocolData.methodNames,
-            },
-          });
-          protocolNode.value += value;
-        });
-
-      treemapData.children?.push(protocolNode);
-      treemapData.value += protocolNode.value;
+      treemapData.children?.push(tokenNode);
+      treemapData.value += tokenNode.value;
     });
 
     console.log("Treemap data:", treemapData);
@@ -202,11 +174,11 @@ export function TransactionAnalytics({
         margin={{ top: 10, right: 10, bottom: 10, left: 10 }}
         labelSkipSize={32}
         label={(d) => {
-          const parts = d.id.split(" - ");
+          const rawData = d.data.rawData;
           const value = Number(d.value).toFixed(4);
-          return parts.length > 1
-            ? `${parts[1]} (${value} Ξ)`
-            : `${parts[0]} (${value} Ξ)`;
+          return rawData
+            ? `${rawData.symbol} (${value} Ξ)`
+            : `${d.id} (${value} Ξ)`;
         }}
         tooltip={({ node }) => {
           const data = node.data.rawData;
@@ -215,8 +187,7 @@ export function TransactionAnalytics({
           return (
             <div className="bg-white dark:bg-gray-800 p-3 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700">
               <div className="font-medium text-gray-900 dark:text-white">
-                {data.protocol}
-                {data.type !== "protocol" && ` - ${data.type}`}
+                {data.symbol} ({data.token})
               </div>
               <div className="mt-2 space-y-1 text-sm">
                 <div className="text-gray-600 dark:text-gray-300">
@@ -241,7 +212,7 @@ export function TransactionAnalytics({
         parentLabelPosition="left"
         parentLabelTextColor={{ from: "color", modifiers: [["darker", 3]] }}
         borderColor={{ from: "color", modifiers: [["darker", 0.1]] }}
-        colors={(node) => node.data.color || PROTOCOL_COLORS.unknown}
+        colors={(node) => node.data.color || TOKEN_COLORS.unknown}
         theme={{
           background: "transparent",
           textColor: "#fff",

@@ -3,6 +3,7 @@ import { DataSource } from "typeorm";
 import { ContractCache } from "../entities/ContractCache";
 import { createComponentLogger, type LogContext } from "../utils/logger";
 import { COMMON_CONTRACTS } from "../data/commonContracts";
+import pLimit from "p-limit";
 
 interface TransactionDetails {
   protocol?: string;
@@ -16,9 +17,26 @@ interface TransactionDetails {
     | "lending"
     | "sandwich"
     | "unknown"
-    | "transfer";
+    | "transfer"
+    | "contract_creation";
   value?: string;
-  category?: string;
+  category?:
+    | "dex" // For DEX-related transactions (swaps, liquidity)
+    | "defi" // For lending, borrowing, etc.
+    | "bridge" // For cross-chain bridges
+    | "token" // For ERC20 token transfers
+    | "native" // For ETH transfers
+    | "deployment" // For contract deployments
+    | "other"; // For unknown or uncategorized
+  token?: string;
+  tokenSymbol?: string;
+  tokenDecimals?: number;
+  tokenAmount?: string;
+}
+
+interface ProtocolInfo {
+  name: string;
+  type: TransactionDetails["category"];
 }
 
 interface TokenInfo {
@@ -35,18 +53,51 @@ const ERC20_METHODS = {
   APPROVE: "0x095ea7b3", // approve(address,uint256)
 } as const;
 
-type ERC20MethodSignature = (typeof ERC20_METHODS)[keyof typeof ERC20_METHODS];
-
-// Common ERC20 ABI for decoding
-const ERC20_ABI = [
-  "function transfer(address to, uint256 value) external returns (bool)",
-  "function transferFrom(address from, address to, uint256 value) external returns (bool)",
-  "function approve(address spender, uint256 value) external returns (bool)",
-  "function balanceOf(address owner) external view returns (uint256)",
-  "function allowance(address owner, address spender) external view returns (uint256)",
-  "function symbol() external view returns (string)",
-  "function decimals() external view returns (uint8)",
-] as const;
+// Common token addresses
+const KNOWN_TOKENS: { [address: string]: TokenInfo } = {
+  "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": {
+    symbol: "WETH",
+    decimals: 18,
+    lastUpdated: 0,
+    address: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+  },
+  "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": {
+    symbol: "USDC",
+    decimals: 6,
+    lastUpdated: 0,
+    address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+  },
+  "0xdac17f958d2ee523a2206206994597c13d831ec7": {
+    symbol: "USDT",
+    decimals: 6,
+    lastUpdated: 0,
+    address: "0xdac17f958d2ee523a2206206994597c13d831ec7",
+  },
+  "0x6b175474e89094c44da98b954eedeac495271d0f": {
+    symbol: "DAI",
+    decimals: 18,
+    lastUpdated: 0,
+    address: "0x6b175474e89094c44da98b954eedeac495271d0f",
+  },
+  "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599": {
+    symbol: "WBTC",
+    decimals: 8,
+    lastUpdated: 0,
+    address: "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+  },
+  "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984": {
+    symbol: "UNI",
+    decimals: 18,
+    lastUpdated: 0,
+    address: "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",
+  },
+  "0x514910771af9ca656af840dff83e8264ecf986ca": {
+    symbol: "LINK",
+    decimals: 18,
+    lastUpdated: 0,
+    address: "0x514910771af9ca656af840dff83e8264ecf986ca",
+  },
+};
 
 // Method signatures for different transaction types
 const METHOD_SIGNATURES = {
@@ -78,19 +129,21 @@ type MethodSignature =
   (typeof METHOD_SIGNATURES)[keyof typeof METHOD_SIGNATURES][number];
 
 export class ProtocolAnalyzer {
-  private provider: ethers.WebSocketProvider;
-  private logger = createComponentLogger("ProtocolAnalyzer");
+  private provider: ethers.Provider;
   private db: DataSource;
+  private logger: ReturnType<typeof createComponentLogger>;
+  private tokenCache: Map<string, TokenInfo> = new Map(
+    Object.entries(KNOWN_TOKENS)
+  );
   private contractCache: Map<string, ContractCache> = new Map();
-  private knownProtocols: Map<string, { name: string; type: string }> =
-    new Map();
-  private erc20Interface = new ethers.Interface(ERC20_ABI);
-  private tokenInfoCache: Map<string, TokenInfo> = new Map();
-  private readonly TOKEN_CACHE_TTL = 3600000; // 1 hour in milliseconds
+  private knownProtocols: Map<string, ProtocolInfo> = new Map();
+  private requestLimiter = pLimit(5); // Limit concurrent requests
+  private tokenRequestQueue = new Map<string, Promise<TokenInfo | null>>();
 
-  constructor(provider: ethers.WebSocketProvider, db: DataSource) {
+  constructor(provider: ethers.Provider, db: DataSource) {
     this.provider = provider;
     this.db = db;
+    this.logger = createComponentLogger("ProtocolAnalyzer");
     this.initializeKnownProtocols();
   }
 
@@ -98,253 +151,240 @@ export class ProtocolAnalyzer {
     Object.entries(COMMON_CONTRACTS).forEach(([address, contract]) => {
       this.knownProtocols.set(address.toLowerCase(), {
         name: contract.name,
-        type: contract.type,
+        type: this.mapContractTypeToCategory(contract.type),
       });
     });
   }
 
-  private async getTokenInfo(tokenAddress: string): Promise<TokenInfo | null> {
-    const address = tokenAddress.toLowerCase();
-    const now = Date.now();
-    const cached = this.tokenInfoCache.get(address);
-
-    // Return cached value if still valid
-    if (cached && now - cached.lastUpdated < this.TOKEN_CACHE_TTL) {
-      return cached;
+  private mapContractTypeToCategory(
+    type: string
+  ): TransactionDetails["category"] {
+    switch (type.toLowerCase()) {
+      case "dex":
+        return "dex";
+      case "lending":
+        return "defi";
+      case "bridge":
+        return "bridge";
+      case "token":
+        return "token";
+      default:
+        return "other";
     }
+  }
 
+  private formatError(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message;
+    }
+    return String(error);
+  }
+
+  async analyzeTransaction(
+    tx: ethers.TransactionResponse
+  ): Promise<TransactionDetails | null> {
     try {
-      const tokenContract = new ethers.Contract(
-        tokenAddress,
-        ERC20_ABI,
-        this.provider
-      );
-      const [symbol, decimals] = await Promise.all([
-        tokenContract.symbol(),
-        tokenContract.decimals(),
-      ]);
+      const details: TransactionDetails = {};
 
-      const tokenInfo: TokenInfo = {
-        symbol,
-        decimals,
-        lastUpdated: now,
-        address,
-      };
+      // Set native ETH value if present
+      if (tx.value) {
+        details.value = tx.value.toString();
+        details.token = "ETH";
+        details.tokenSymbol = "ETH";
+        details.tokenDecimals = 18;
+        details.tokenAmount = tx.value.toString();
+      }
 
-      this.tokenInfoCache.set(address, tokenInfo);
-      return tokenInfo;
+      if (!tx.to) {
+        details.type = "contract_creation";
+        details.category = "deployment";
+        return details;
+      }
+
+      // Get the first 4 bytes of the data (function signature)
+      const methodId = tx.data.slice(0, 10).toLowerCase();
+
+      // Check if this is a token transfer or interaction
+      if (
+        methodId === ERC20_METHODS.TRANSFER ||
+        methodId === ERC20_METHODS.TRANSFER_FROM
+      ) {
+        const tokenInfo = await this.getTokenInfoThrottled(tx.to);
+        if (tokenInfo) {
+          details.token = tx.to;
+          details.tokenSymbol = tokenInfo.symbol;
+          details.tokenDecimals = tokenInfo.decimals;
+
+          // Parse token amount from the transaction data
+          try {
+            const iface = new ethers.Interface([
+              "function transfer(address to, uint256 amount)",
+              "function transferFrom(address from, address to, uint256 amount)",
+            ]);
+            const decoded = iface.parseTransaction({ data: tx.data });
+            if (decoded) {
+              details.tokenAmount =
+                decoded.args[
+                  methodId === ERC20_METHODS.TRANSFER ? 1 : 2
+                ].toString();
+            }
+          } catch (error) {
+            this.logger.debug("Failed to parse token amount", {
+              error: this.formatError(error),
+              txHash: tx.hash,
+            });
+          }
+        }
+      }
+
+      // Check for DEX interactions and extract token info
+      const protocolInfo = await this.identifyProtocol(tx.to);
+      if (protocolInfo) {
+        details.protocol = protocolInfo.name;
+        details.category = protocolInfo.type;
+
+        // For DEX interactions, try to extract token information
+        if (protocolInfo.type === "dex" && tx.data.length >= 138) {
+          try {
+            // Extract potential token addresses from the data
+            // Most DEX methods include token addresses as parameters
+            const potentialTokens = [];
+            for (let i = 34; i < tx.data.length - 40; i += 64) {
+              const potentialAddress = "0x" + tx.data.slice(i, i + 40);
+              if (ethers.isAddress(potentialAddress)) {
+                const tokenInfo = await this.getTokenInfoThrottled(
+                  potentialAddress
+                );
+                if (tokenInfo) {
+                  potentialTokens.push(tokenInfo);
+                }
+              }
+            }
+
+            // Use the first found token for the treemap
+            if (potentialTokens.length > 0) {
+              details.token = potentialTokens[0].address;
+              details.tokenSymbol = potentialTokens[0].symbol;
+              details.tokenDecimals = potentialTokens[0].decimals;
+            }
+          } catch (error) {
+            this.logger.debug(
+              "Failed to extract token info from DEX interaction",
+              {
+                error: this.formatError(error),
+                txHash: tx.hash,
+              }
+            );
+          }
+        }
+      }
+
+      return details;
     } catch (error) {
-      this.logger.debug("Failed to get token info", {
-        error: error instanceof Error ? error.message : String(error),
-        tokenAddress,
+      this.logger.error("Error analyzing transaction", {
+        error: this.formatError(error),
+        txHash: tx.hash,
       });
       return null;
     }
   }
 
-  private async handleERC20Transfer(
-    tx: ethers.TransactionResponse,
-    methodSignature: ERC20MethodSignature
-  ): Promise<TransactionDetails | null> {
-    try {
-      const decoded = this.erc20Interface.parseTransaction({
-        data: tx.data,
-        value: tx.value,
-      });
+  private async identifyProtocol(
+    address: string | undefined
+  ): Promise<ProtocolInfo | null> {
+    if (!address) return null;
 
-      if (!decoded) return null;
+    const normalizedAddress = address.toLowerCase();
 
-      const result: TransactionDetails = {
-        type: "transfer",
-        methodName: decoded.name,
-        params: this.sanitizeParams(decoded.args),
-      };
+    // Check known protocols first
+    const knownProtocol = this.knownProtocols.get(normalizedAddress);
+    if (knownProtocol) return knownProtocol;
 
-      const tokenInfo = await this.getTokenInfo(tx.to!);
-      if (tokenInfo) {
-        result.protocol = `${tokenInfo.symbol} Token`;
-        if (result.params?.value) {
-          result.params.formattedValue = ethers.formatUnits(
-            result.params.value,
-            tokenInfo.decimals
-          );
-        }
-      }
-
-      return result;
-    } catch (error) {
-      this.logger.debug("Failed to decode ERC20 transfer", {
-        error: error instanceof Error ? error.message : String(error),
-        txHash: tx.hash,
-      });
-      // Still return a basic transfer type since we matched the signature
-      return {
-        type: "transfer",
-        methodName: "transfer",
-        protocol: "Unknown Token",
-      };
-    }
-  }
-
-  async analyzeTransaction(
-    tx: ethers.TransactionResponse
-  ): Promise<TransactionDetails> {
-    try {
-      if (!tx.to) return { type: "unknown" };
-
-      const protocol = this.knownProtocols.get(tx.to.toLowerCase());
-      const result: TransactionDetails = {
-        protocol: protocol?.name,
-        value: tx.value.toString(),
-      };
-
-      // Try to decode the transaction data
-      if (tx.data && tx.data.length >= 10) {
-        const methodSignature = tx.data.slice(0, 10).toLowerCase() as
-          | ERC20MethodSignature
-          | MethodSignature;
-
-        // Check if it's an ERC20 transfer first
-        if (
-          Object.values(ERC20_METHODS).includes(
-            methodSignature as ERC20MethodSignature
-          )
-        ) {
-          const transferResult = await this.handleERC20Transfer(
-            tx,
-            methodSignature as ERC20MethodSignature
-          );
-          if (transferResult) return transferResult;
-        }
-
-        // If not an ERC20 transfer or if handling failed, continue with normal flow
-        result.type = this.determineTransactionType(
-          methodSignature as MethodSignature,
-          tx
-        );
-
-        // Try to decode using cached ABI
-        const decoded = await this.decodeTransaction(tx);
-        if (decoded) {
-          result.methodName = decoded.name;
-          result.params = this.sanitizeParams(decoded.args);
-        }
-      }
-
-      // If it's a simple ETH transfer
-      if (tx.data === "0x" && tx.value > BigInt(0)) {
-        result.type = "transfer";
-        result.protocol = "Ethereum";
-        result.methodName = "transfer";
-        result.params = {
-          to: tx.to,
-          value: tx.value.toString(),
-          formattedValue: ethers.formatEther(tx.value),
-        };
-      }
-
-      return result;
-    } catch (error) {
-      this.logger.error("Error analyzing transaction", {
-        error: error instanceof Error ? error.message : String(error),
-        txHash: tx.hash,
-      });
-      return { type: "unknown" };
-    }
-  }
-
-  private async decodeTransaction(tx: ethers.TransactionResponse) {
-    // Try to get method name from contract cache
+    // Check contract cache
     const cachedContract = await this.db
       .getRepository(ContractCache)
-      .findOne({ where: { address: tx.to!.toLowerCase() } });
+      .findOne({ where: { address: normalizedAddress } });
 
-    if (cachedContract?.abi) {
-      try {
-        const iface = new ethers.Interface(cachedContract.abi);
-        return iface.parseTransaction({ data: tx.data, value: tx.value });
-      } catch (error) {
-        this.logger.debug("Failed to decode transaction", {
-          error: error instanceof Error ? error.message : String(error),
-          txHash: tx.hash,
-        });
-      }
-    }
-
-    // Try to use ABI from COMMON_CONTRACTS if available
-    const commonContract = COMMON_CONTRACTS[tx.to!.toLowerCase()];
-    if (commonContract?.abi) {
-      try {
-        const iface = new ethers.Interface(commonContract.abi);
-        return iface.parseTransaction({ data: tx.data, value: tx.value });
-      } catch (error) {
-        this.logger.debug("Failed to decode transaction with common ABI", {
-          error: error instanceof Error ? error.message : String(error),
-          txHash: tx.hash,
-        });
-      }
+    if (cachedContract?.type) {
+      return {
+        name: cachedContract.contractName || "Unknown Protocol",
+        type: this.mapContractTypeToCategory(cachedContract.type),
+      };
     }
 
     return null;
   }
 
-  private determineTransactionType(
-    methodSignature: MethodSignature,
-    tx: ethers.TransactionResponse
-  ): TransactionDetails["type"] {
-    if (METHOD_SIGNATURES.SWAP.includes(methodSignature as any)) return "swap";
-    if (METHOD_SIGNATURES.LIQUIDITY.includes(methodSignature as any))
-      return "liquidity";
-    if (METHOD_SIGNATURES.LENDING.includes(methodSignature as any))
-      return "lending";
-    if (METHOD_SIGNATURES.BRIDGE.includes(methodSignature as any))
-      return "bridge";
+  private async getTokenInfoThrottled(
+    address: string
+  ): Promise<TokenInfo | null> {
+    const normalizedAddress = address.toLowerCase();
 
-    // Check known bridge contracts
-    const BRIDGE_CONTRACTS = new Set([
-      "0x40ec5b33f54e0e8a33a975908c5ba1c14e5bbbdf", // Polygon Bridge
-      "0xa0c68c638235ee32657e8f720a23cec1bfc77c77", // Arbitrum Bridge
-      "0x3ee18b2214aff97000d974cf647e7c347e8fa585", // Wormhole Bridge
-      "0x99c9fc46f92e8a1c0dec1b1747d010903e884be1", // Optimism Bridge
-    ]);
-
-    if (tx.to && BRIDGE_CONTRACTS.has(tx.to.toLowerCase())) {
-      return "bridge";
+    // Check if we already have a request in flight for this token
+    const existingRequest = this.tokenRequestQueue.get(normalizedAddress);
+    if (existingRequest) {
+      return existingRequest;
     }
 
-    // Check if we know the contract type
-    const protocol = this.knownProtocols.get(tx.to?.toLowerCase() || "");
-    if (protocol?.type === "dex") return "swap";
-    if (protocol?.type === "lending") return "lending";
-    if (protocol?.type === "bridge") return "bridge";
-
-    return "unknown";
-  }
-
-  private sanitizeParams(params: any): any {
-    if (params === null || params === undefined) {
-      return params;
+    // Check cache first
+    const cached = this.tokenCache.get(normalizedAddress);
+    if (cached && Date.now() - cached.lastUpdated < 24 * 60 * 60 * 1000) {
+      return cached;
     }
 
-    // Convert BigInt to string
-    if (typeof params === "bigint") {
-      return params.toString();
-    }
+    // Create a new request and add it to the queue
+    const request = this.requestLimiter(async () => {
+      try {
+        // Double-check cache in case another request completed while we were waiting
+        const cachedAgain = this.tokenCache.get(normalizedAddress);
+        if (
+          cachedAgain &&
+          Date.now() - cachedAgain.lastUpdated < 24 * 60 * 60 * 1000
+        ) {
+          return cachedAgain;
+        }
 
-    // Handle arrays
-    if (Array.isArray(params)) {
-      return params.map((item) => this.sanitizeParams(item));
-    }
+        // Try to get token info from the contract
+        const contract = new ethers.Contract(
+          address,
+          [
+            "function symbol() view returns (string)",
+            "function decimals() view returns (uint8)",
+          ],
+          this.provider
+        );
 
-    // Handle objects
-    if (typeof params === "object") {
-      const sanitized: any = {};
-      for (const [key, value] of Object.entries(params)) {
-        sanitized[key] = this.sanitizeParams(value);
+        const [symbol, decimals] = await Promise.all([
+          contract.symbol().catch(() => "UNKNOWN"),
+          contract.decimals().catch(() => 18),
+        ]);
+
+        const tokenInfo: TokenInfo = {
+          symbol,
+          decimals,
+          lastUpdated: Date.now(),
+          address: normalizedAddress,
+        };
+
+        // Update cache
+        this.tokenCache.set(normalizedAddress, tokenInfo);
+        return tokenInfo;
+      } catch (error) {
+        this.logger.debug("Failed to get token info", {
+          error: this.formatError(error),
+          address,
+        });
+        return null;
+      } finally {
+        // Remove from queue after a delay to prevent immediate re-queuing
+        setTimeout(() => {
+          this.tokenRequestQueue.delete(normalizedAddress);
+        }, 1000);
       }
-      return sanitized;
-    }
+    });
 
-    return params;
+    // Add to queue and return
+    this.tokenRequestQueue.set(normalizedAddress, request);
+    return request;
   }
 }

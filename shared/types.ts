@@ -6,6 +6,10 @@ export interface TransactionDetails {
   type?: "swap" | "liquidity" | "bridge" | "lending" | "sandwich" | "unknown";
   category?: string;
   value?: string;
+  token?: string;
+  tokenSymbol?: string;
+  tokenDecimals?: number;
+  tokenAmount?: string;
 }
 
 export interface BlockPrediction {
@@ -35,6 +39,8 @@ export interface BlockComparison {
   actualTransactions: string[];
   accuracy: number;
   miner: string;
+  builder?: string;
+  builderName?: string;
   timestamp: string | Date;
   averageGasPrice?: number;
 }
