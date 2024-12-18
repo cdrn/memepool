@@ -1,9 +1,11 @@
 import { ethers } from "ethers";
 import { DataSource } from "typeorm";
 import { ContractCache } from "../entities/ContractCache";
-import { createComponentLogger, type LogContext } from "../utils/logger";
+import { createComponentLogger } from "../utils/logger";
 import { COMMON_CONTRACTS } from "../data/commonContracts";
+import { ContractCacheService } from "./ContractCacheService";
 import pLimit from "p-limit";
+import winston from "winston";
 
 interface TransactionDetails {
   protocol?: string;
@@ -139,11 +141,13 @@ export class ProtocolAnalyzer {
   private knownProtocols: Map<string, ProtocolInfo> = new Map();
   private requestLimiter = pLimit(5); // Limit concurrent requests
   private tokenRequestQueue = new Map<string, Promise<TokenInfo | null>>();
+  private contractCacheService: ContractCacheService;
 
   constructor(provider: ethers.Provider, db: DataSource) {
     this.provider = provider;
     this.db = db;
     this.logger = createComponentLogger("ProtocolAnalyzer");
+    this.contractCacheService = new ContractCacheService(db, provider);
     this.initializeKnownProtocols();
   }
 
@@ -151,7 +155,7 @@ export class ProtocolAnalyzer {
     Object.entries(COMMON_CONTRACTS).forEach(([address, contract]) => {
       this.knownProtocols.set(address.toLowerCase(), {
         name: contract.name,
-        type: this.mapContractTypeToCategory(contract.type),
+        type: this.mapContractTypeToCategory(contract.type || "other"),
       });
     });
   }
@@ -168,6 +172,11 @@ export class ProtocolAnalyzer {
         return "bridge";
       case "token":
         return "token";
+      case "oracle":
+        return "other";
+      case "nft":
+        return "other";
+      case "unknown":
       default:
         return "other";
     }
@@ -279,6 +288,14 @@ export class ProtocolAnalyzer {
         }
       }
 
+      // Convert any BigInt values to strings
+      const detailsWithBigInts = details as { [key: string]: unknown };
+      Object.entries(detailsWithBigInts).forEach(([key, value]) => {
+        if (typeof value === "bigint") {
+          detailsWithBigInts[key] = value.toString();
+        }
+      });
+
       return details;
     } catch (error) {
       this.logger.error("Error analyzing transaction", {
@@ -300,16 +317,38 @@ export class ProtocolAnalyzer {
     const knownProtocol = this.knownProtocols.get(normalizedAddress);
     if (knownProtocol) return knownProtocol;
 
-    // Check contract cache
-    const cachedContract = await this.db
-      .getRepository(ContractCache)
-      .findOne({ where: { address: normalizedAddress } });
+    // Try to get contract data from cache or fetch it
+    const contractData = await this.contractCacheService.getContractData(
+      normalizedAddress
+    );
 
-    if (cachedContract?.type) {
+    if (contractData?.type) {
       return {
-        name: cachedContract.contractName || "Unknown Protocol",
-        type: this.mapContractTypeToCategory(cachedContract.type),
+        name: contractData.contractName || "Unknown Protocol",
+        type: this.mapContractTypeToCategory(contractData.type),
       };
+    }
+
+    // If we got contract data but no type, try to determine the type
+    if (contractData?.abi) {
+      // Check if it's a token contract
+      const isToken = contractData.abi.some(
+        (item: any) =>
+          item.type === "function" &&
+          ["transfer", "transferFrom", "approve"].includes(item.name)
+      );
+
+      if (isToken) {
+        await this.contractCacheService.updateProtocolInfo(
+          normalizedAddress,
+          "ERC20",
+          "token"
+        );
+        return {
+          name: contractData.contractName || "ERC20 Token",
+          type: "token",
+        };
+      }
     }
 
     return null;

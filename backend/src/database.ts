@@ -2,6 +2,7 @@ import { DataSource } from "typeorm";
 import { Block } from "./entities/Block";
 import { Transaction } from "./entities/Transaction";
 import { BlockPrediction } from "./entities/BlockPrediction";
+import { ContractCache } from "./entities/ContractCache";
 import { createComponentLogger } from "./utils/logger";
 
 const logger = createComponentLogger("Database");
@@ -15,7 +16,7 @@ export const AppDataSource = new DataSource({
   database: process.env.DB_NAME || "memepool",
   synchronize: true, // Be careful with this in production
   logging: ["error", "warn", "schema"], // Only log errors, warnings, and schema changes
-  entities: [Block, Transaction, BlockPrediction],
+  entities: [Block, Transaction, BlockPrediction, ContractCache],
   subscribers: [],
   migrations: [],
 });

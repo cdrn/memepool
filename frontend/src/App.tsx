@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import {
   ChartBarIcon,
   ClockIcon,
@@ -27,6 +27,7 @@ function App() {
   const [isDark, setIsDark] = useState(() =>
     document.documentElement.classList.contains("dark")
   );
+  const scrollPositionRef = useRef(0);
 
   useEffect(() => {
     // Initialize dark mode from system preference
@@ -36,7 +37,7 @@ function App() {
     }
   }, []);
 
-  const toggleDarkMode = () => {
+  const toggleDarkMode = useCallback(() => {
     if (isDark) {
       document.documentElement.classList.remove("dark");
       setIsDark(false);
@@ -44,38 +45,68 @@ function App() {
       document.documentElement.classList.add("dark");
       setIsDark(true);
     }
-  };
+  }, [isDark]);
+
+  const fetchData = useCallback(async () => {
+    try {
+      // Store current scroll position before fetching
+      scrollPositionRef.current = window.scrollY;
+
+      const [predictionsRes, comparisonsRes] = await Promise.all([
+        fetch("http://localhost:3001/api/predictions"),
+        fetch("http://localhost:3001/api/comparisons"),
+      ]);
+
+      if (!predictionsRes.ok || !comparisonsRes.ok) {
+        throw new Error("Failed to fetch data from API");
+      }
+
+      const predictionsData = await predictionsRes.json();
+      const comparisonsData = await comparisonsRes.json();
+
+      // Only update state if data has changed
+      setPredictions((prev) => {
+        if (
+          prev.length > 0 &&
+          predictionsData.predictions.length > 0 &&
+          prev[0].blockNumber === predictionsData.predictions[0].blockNumber
+        ) {
+          return prev;
+        }
+        return predictionsData.predictions;
+      });
+
+      setTotalPredictions((prev) => {
+        if (prev === predictionsData.totalCount) return prev;
+        return predictionsData.totalCount;
+      });
+
+      setComparisons((prev) => {
+        if (
+          prev.length > 0 &&
+          comparisonsData.length > 0 &&
+          prev[0].blockNumber === comparisonsData[0].blockNumber
+        ) {
+          return prev;
+        }
+        return comparisonsData;
+      });
+
+      setError(null);
+    } catch (error) {
+      console.error("Error fetching data:", error);
+      setError(
+        error instanceof Error ? error.message : "Unknown error occurred"
+      );
+    } finally {
+      // Restore scroll position after state updates
+      requestAnimationFrame(() => {
+        window.scrollTo(0, scrollPositionRef.current);
+      });
+    }
+  }, []);
 
   useEffect(() => {
-    const fetchData = async () => {
-      try {
-        setLoading(true);
-        const [predictionsRes, comparisonsRes] = await Promise.all([
-          fetch("http://localhost:3001/api/predictions"),
-          fetch("http://localhost:3001/api/comparisons"),
-        ]);
-
-        if (!predictionsRes.ok || !comparisonsRes.ok) {
-          throw new Error("Failed to fetch data from API");
-        }
-
-        const predictionsData = await predictionsRes.json();
-        const comparisonsData = await comparisonsRes.json();
-
-        setPredictions(predictionsData.predictions);
-        setTotalPredictions(predictionsData.totalCount);
-        setComparisons(comparisonsData);
-        setError(null);
-      } catch (error) {
-        console.error("Error fetching data:", error);
-        setError(
-          error instanceof Error ? error.message : "Unknown error occurred"
-        );
-      } finally {
-        setLoading(false);
-      }
-    };
-
     // Initial fetch
     fetchData();
 
@@ -86,7 +117,7 @@ function App() {
     return () => {
       clearInterval(pollInterval);
     };
-  }, []); // Empty dependency array means this effect runs once on mount
+  }, [fetchData]);
 
   const latestComparison = comparisons[0];
   const averageAccuracy =
@@ -213,15 +244,18 @@ function App() {
     );
   };
 
-  const handleComparisonClick = (comparison: BlockComparison) => {
-    // Find the corresponding prediction
-    const prediction = predictions.find(
-      (p) => p.blockNumber === comparison.blockNumber
-    );
-    if (prediction) {
-      setSelectedBlock(prediction);
-    }
-  };
+  const handleComparisonClick = useCallback(
+    (comparison: BlockComparison) => {
+      // Find the corresponding prediction
+      const prediction = predictions.find(
+        (p) => p.blockNumber === comparison.blockNumber
+      );
+      if (prediction) {
+        setSelectedBlock(prediction);
+      }
+    },
+    [predictions]
+  );
 
   if (loading) {
     return (

@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useCallback } from "react";
 import { ResponsiveTreeMap } from "@nivo/treemap";
 import type { BlockPrediction, BlockComparison } from "@shared/types";
 
@@ -19,8 +19,23 @@ interface TreemapData {
     totalValue: number;
     gasValue: number;
     methodNames: Set<string>;
+    protocols: Set<string>;
+    types: Set<string>;
   };
 }
+
+// Color scheme for different protocols
+const PROTOCOL_COLORS = {
+  uniswap: "#FF007A",
+  sushiswap: "#FA52A0",
+  curve: "#0594EE",
+  balancer: "#1E1E1E",
+  aave: "#B6509E",
+  compound: "#00D395",
+  maker: "#1AAB9B",
+  chainlink: "#2A5ADA",
+  unknown: "#A9A9A9",
+} as const;
 
 // Color scheme for different token types
 const TOKEN_COLORS = {
@@ -45,28 +60,25 @@ export function TransactionAnalytics({
   predictions,
   comparisons,
 }: TransactionAnalyticsProps) {
-  const data = useMemo(() => {
-    if (!predictions.length) return null;
+  const processData = useCallback((prediction: BlockPrediction) => {
+    console.log("Processing block:", prediction.blockNumber);
 
-    const latestPrediction = predictions[0];
-    console.log("Processing block:", latestPrediction.blockNumber);
-
-    // Group transactions by token
-    const tokenGroups: {
+    // Group transactions by protocol instead of token
+    const protocolGroups: {
       [key: string]: {
-        symbol: string;
         txCount: number;
         totalValue: number;
         gasValue: number;
         methodNames: Set<string>;
-        protocols: Set<string>;
+        tokens: Set<string>;
+        types: Set<string>;
       };
     } = {};
 
     let totalBlockValue = 0;
 
-    latestPrediction.predictedTransactions.forEach((txHash) => {
-      const details = latestPrediction.transactionDetails[txHash];
+    prediction.predictedTransactions.forEach((txHash) => {
+      const details = prediction.transactionDetails[txHash];
       if (!details) return;
 
       // Convert value from wei to ETH (1e18)
@@ -78,9 +90,9 @@ export function TransactionAnalytics({
         value = 0;
       }
 
-      // Calculate gas cost in ETH
-      const gasLimit = 200000; // Default gas limit if not specified
-      const gasValue = (latestPrediction.predictedGasPrice * gasLimit) / 1e9;
+      // Use actual gas limit from transaction if available
+      const gasLimit = details.gasLimit ? Number(details.gasLimit) : 200000;
+      const gasValue = (prediction.predictedGasPrice * gasLimit) / 1e9;
       const totalValue = value + gasValue;
 
       // Skip dust transactions
@@ -88,77 +100,121 @@ export function TransactionAnalytics({
 
       totalBlockValue += totalValue;
 
-      // Get token information from the transaction details
-      const token = details.token || "ETH";
-      const symbol = details.tokenSymbol || token;
+      // Group by protocol
       const protocol = details.protocol || "unknown";
-      const methodName = details.methodName || "unknown";
-
-      if (!tokenGroups[token]) {
-        tokenGroups[token] = {
-          symbol,
+      if (!protocolGroups[protocol]) {
+        protocolGroups[protocol] = {
           txCount: 0,
           totalValue: 0,
           gasValue: 0,
           methodNames: new Set(),
-          protocols: new Set(),
+          tokens: new Set(),
+          types: new Set(),
         };
       }
 
-      tokenGroups[token].totalValue += totalValue;
-      tokenGroups[token].txCount += 1;
-      tokenGroups[token].gasValue += gasValue;
-      if (methodName) tokenGroups[token].methodNames.add(methodName);
-      if (protocol) tokenGroups[token].protocols.add(protocol);
+      protocolGroups[protocol].totalValue += totalValue;
+      protocolGroups[protocol].txCount += 1;
+      protocolGroups[protocol].gasValue += gasValue;
+      if (details.methodName)
+        protocolGroups[protocol].methodNames.add(details.methodName);
+      if (details.token) protocolGroups[protocol].tokens.add(details.token);
+      if (details.type) protocolGroups[protocol].types.add(details.type);
     });
 
     // Convert to treemap format
     const treemapData: TreemapData = {
-      id: `Block #${latestPrediction.blockNumber}`,
+      id: `Block #${prediction.blockNumber}`,
       value: 0,
       children: [],
     };
 
-    // Sort tokens by total value
-    const sortedTokens = Object.entries(tokenGroups)
-      .map(([token, data]) => ({
-        token,
-        symbol: data.symbol,
+    // Sort protocols by total value
+    const sortedProtocols = Object.entries(protocolGroups)
+      .map(([protocol, data]) => ({
+        protocol,
         totalValue: data.totalValue,
         txCount: data.txCount,
         gasValue: data.gasValue,
         methodNames: data.methodNames,
-        protocols: data.protocols,
+        tokens: data.tokens,
+        types: data.types,
       }))
       .sort((a, b) => b.totalValue - a.totalValue);
 
-    sortedTokens.forEach((tokenData) => {
-      // Skip tokens with less than 0.1% of total block value
-      if (tokenData.totalValue / totalBlockValue < 0.001) return;
+    sortedProtocols.forEach((protocolData) => {
+      // Skip protocols with less than 0.1% of total block value
+      if (protocolData.totalValue / totalBlockValue < 0.001) return;
 
-      const tokenNode: TreemapData = {
-        id: tokenData.token,
-        value: tokenData.totalValue,
+      const protocolNode: TreemapData = {
+        id: protocolData.protocol,
+        value: protocolData.totalValue,
         color:
-          TOKEN_COLORS[tokenData.symbol as keyof typeof TOKEN_COLORS] ||
-          TOKEN_COLORS.unknown,
+          PROTOCOL_COLORS[
+            protocolData.protocol.toLowerCase() as keyof typeof PROTOCOL_COLORS
+          ] || PROTOCOL_COLORS.unknown,
         rawData: {
-          token: tokenData.token,
-          symbol: tokenData.symbol,
-          txCount: tokenData.txCount,
-          totalValue: tokenData.totalValue,
-          gasValue: tokenData.gasValue,
-          methodNames: tokenData.methodNames,
+          token: Array.from(protocolData.tokens).join(", "),
+          symbol: protocolData.protocol,
+          txCount: protocolData.txCount,
+          totalValue: protocolData.totalValue,
+          gasValue: protocolData.gasValue,
+          methodNames: protocolData.methodNames,
+          protocols: new Set([protocolData.protocol]),
+          types: protocolData.types,
         },
       };
 
-      treemapData.children?.push(tokenNode);
-      treemapData.value += tokenNode.value;
+      treemapData.children?.push(protocolNode);
+      treemapData.value += protocolNode.value;
     });
 
-    console.log("Treemap data:", treemapData);
     return treemapData;
-  }, [predictions]);
+  }, []);
+
+  const data = useMemo(() => {
+    if (!predictions.length) return null;
+    return processData(predictions[0]);
+  }, [predictions, processData]);
+
+  const renderTooltip = useCallback(({ node }: { node: any }) => {
+    const data = node.data.rawData;
+    if (!data) return null;
+
+    return (
+      <div className="bg-white dark:bg-gray-800 p-3 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700">
+        <div className="font-medium text-gray-900 dark:text-white">
+          {data.symbol}
+        </div>
+        <div className="mt-2 space-y-1 text-sm">
+          <div className="text-gray-600 dark:text-gray-300">
+            Value: {data.totalValue.toFixed(4)} Ξ
+          </div>
+          <div className="text-gray-600 dark:text-gray-300">
+            Gas Cost: {data.gasValue.toFixed(4)} Ξ
+          </div>
+          <div className="text-gray-600 dark:text-gray-300">
+            Transactions: {data.txCount}
+          </div>
+          {data.types.size > 0 && (
+            <div className="text-gray-600 dark:text-gray-300">
+              Types: {Array.from(data.types).join(", ")}
+            </div>
+          )}
+          {data.token && (
+            <div className="text-gray-600 dark:text-gray-300">
+              Tokens: {data.token}
+            </div>
+          )}
+          {data.methodNames.size > 0 && (
+            <div className="text-gray-600 dark:text-gray-300 font-mono text-xs">
+              Methods: {Array.from(data.methodNames).join(", ")}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }, []);
 
   if (!data) {
     return <div>No data available</div>;
@@ -180,39 +236,12 @@ export function TransactionAnalytics({
             ? `${rawData.symbol} (${value} Ξ)`
             : `${d.id} (${value} Ξ)`;
         }}
-        tooltip={({ node }) => {
-          const data = node.data.rawData;
-          if (!data) return null;
-
-          return (
-            <div className="bg-white dark:bg-gray-800 p-3 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700">
-              <div className="font-medium text-gray-900 dark:text-white">
-                {data.symbol} ({data.token})
-              </div>
-              <div className="mt-2 space-y-1 text-sm">
-                <div className="text-gray-600 dark:text-gray-300">
-                  Value: {data.totalValue.toFixed(4)} Ξ
-                </div>
-                <div className="text-gray-600 dark:text-gray-300">
-                  Gas Cost: {data.gasValue.toFixed(4)} Ξ
-                </div>
-                <div className="text-gray-600 dark:text-gray-300">
-                  Transactions: {data.txCount}
-                </div>
-                {data.methodNames.size > 0 && (
-                  <div className="text-gray-600 dark:text-gray-300">
-                    Methods: {Array.from(data.methodNames).join(", ")}
-                  </div>
-                )}
-              </div>
-            </div>
-          );
-        }}
+        tooltip={renderTooltip}
         labelTextColor={{ from: "color", modifiers: [["darker", 3]] }}
         parentLabelPosition="left"
         parentLabelTextColor={{ from: "color", modifiers: [["darker", 3]] }}
         borderColor={{ from: "color", modifiers: [["darker", 0.1]] }}
-        colors={(node) => node.data.color || TOKEN_COLORS.unknown}
+        colors={(node) => node.data.color || PROTOCOL_COLORS.unknown}
         theme={{
           background: "transparent",
           textColor: "#fff",

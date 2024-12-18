@@ -55,7 +55,20 @@ export class MempoolMonitor {
       ]);
       this.logger.info("Subscribed to pending transactions in the mempool");
 
+      let pendingCount = 0;
+      const startTime = Date.now();
+
+      // Log stats every minute instead of every 10 seconds
+      setInterval(() => {
+        const elapsed = (Date.now() - startTime) / 1000;
+        this.logger.info("Mempool stats", {
+          totalTransactions: pendingCount,
+          transactionsPerSecond: (pendingCount / elapsed).toFixed(2),
+        });
+      }, 60000);
+
       this.provider.on("pending", async (txHash: string) => {
+        pendingCount++;
         await this.handlePendingTransaction(txHash);
       });
     } catch (error) {
@@ -69,11 +82,18 @@ export class MempoolMonitor {
   private async handlePendingTransaction(txHash: string) {
     try {
       await this.requestLimiter(async () => {
-        const tx = await this.provider.getTransaction(txHash);
-        if (!tx) {
-          this.logger.debug("Failed to fetch transaction details", { txHash });
+        // First check if we already have this transaction
+        const existing = await this.db.getRepository(Transaction).findOne({
+          where: { hash: txHash },
+        });
+
+        if (existing) {
+          // Skip if we already have it
           return;
         }
+
+        const tx = await this.provider.getTransaction(txHash);
+        if (!tx) return;
 
         await this.storePendingTransaction(tx);
       });
@@ -106,18 +126,28 @@ export class MempoolMonitor {
 
       await this.db.getRepository(Transaction).save(transaction);
 
-      this.logger.debug("Stored pending transaction", {
-        txHash: tx.hash,
-        from: tx.from,
-        to: tx.to || "contract creation",
-        value: tx.value.toString(),
-        gasPrice: (tx.gasPrice || tx.maxFeePerGas || 0n).toString(),
-      });
-    } catch (error) {
-      this.logger.error("Failed to store pending transaction", {
-        txHash: tx.hash,
-        error: this.formatError(error),
-      });
+      // Only log every 100th transaction to reduce noise
+      if (Math.random() < 0.01) {
+        this.logger.info("Sample pending transaction", {
+          txHash: tx.hash,
+          from: tx.from,
+          to: tx.to || "contract creation",
+          value: tx.value.toString(),
+          gasPrice: (tx.gasPrice || tx.maxFeePerGas || 0n).toString(),
+        });
+      }
+    } catch (error: unknown) {
+      // Check if error is an object with a message property
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
+
+      // Only log if it's not a duplicate key error
+      if (!errorMessage.includes("duplicate key")) {
+        this.logger.error("Failed to store pending transaction", {
+          txHash: tx.hash,
+          error: this.formatError(error),
+        });
+      }
     }
   }
 

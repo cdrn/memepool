@@ -4,7 +4,9 @@ import { initializeDatabase } from "./database";
 import { BlockMonitor } from "./services/BlockMonitor";
 import { MempoolMonitor } from "./services/MempoolMonitor";
 import { AnalyticsMonitor } from "./services/AnalyticsMonitor";
+import { PredictionService } from "./services/PredictionService";
 import { startApiServer } from "./api/server";
+import { ethers } from "ethers";
 
 const logger = createComponentLogger("App");
 const ETH_WS_URL = process.env.ETH_WS_URL;
@@ -29,16 +31,19 @@ async function startApplication() {
     // Initialize database
     const db = await initializeDatabase();
 
-    // Initialize monitors
+    // Initialize services
+    const provider = new ethers.WebSocketProvider(ETH_WS_URL as string);
     const blockMonitor = new BlockMonitor(ETH_WS_URL as string, db);
     const mempoolMonitor = new MempoolMonitor(ETH_WS_URL as string, db);
     const analyticsMonitor = new AnalyticsMonitor(ETH_WS_URL as string, db);
+    const predictionService = new PredictionService(provider, db);
 
-    // Start monitors and API server
+    // Start all services
     await Promise.all([
       blockMonitor.start(),
       mempoolMonitor.start(),
       analyticsMonitor.start(),
+      predictionService.start(),
       startApiServer(db),
     ]);
 

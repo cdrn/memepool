@@ -1,18 +1,17 @@
 import { DataSource, Repository } from "typeorm";
 import { ContractCache } from "../entities/ContractCache";
 import axios from "axios";
-import { Logger } from "winston";
 import { ethers } from "ethers";
 import { Not, IsNull } from "typeorm";
+import { createComponentLogger } from "../utils/logger";
 
 export class ContractCacheService {
   private repository: Repository<ContractCache>;
-  private logger: Logger;
+  private logger = createComponentLogger("ContractCacheService");
   private provider: ethers.Provider;
 
-  constructor(db: DataSource, logger: Logger, provider: ethers.Provider) {
+  constructor(db: DataSource, provider: ethers.Provider) {
     this.repository = db.getRepository(ContractCache);
-    this.logger = logger;
     this.provider = provider;
   }
 

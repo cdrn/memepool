@@ -1,6 +1,6 @@
 import {
   Entity,
-  PrimaryColumn,
+  PrimaryGeneratedColumn,
   Column,
   CreateDateColumn,
   ManyToOne,
@@ -16,7 +16,11 @@ export enum TransactionStatus {
 
 @Entity()
 export class Transaction {
-  @PrimaryColumn()
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column()
+  @Index({ unique: true })
   hash!: string;
 
   @Column()

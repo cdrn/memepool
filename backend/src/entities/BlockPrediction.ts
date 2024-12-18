@@ -17,7 +17,10 @@ export class BlockPrediction {
   @Index()
   blockNumber!: number;
 
-  @ManyToOne(() => Block, (block) => block.predictions, { nullable: true })
+  @ManyToOne(() => Block, (block) => block.predictions, {
+    nullable: true,
+    createForeignKeyConstraints: false,
+  })
   block?: Block;
 
   @Column("simple-array")

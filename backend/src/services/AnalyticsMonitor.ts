@@ -3,57 +3,45 @@ import { DataSource } from "typeorm";
 import { createComponentLogger } from "../utils/logger";
 import { ProtocolAnalyzer } from "./ProtocolAnalyzer";
 import { BlockPrediction } from "../entities/BlockPrediction";
+import pLimit from "p-limit";
 
 export class AnalyticsMonitor {
   private provider: ethers.WebSocketProvider;
   private logger = createComponentLogger("AnalyticsMonitor");
   private db: DataSource;
   private protocolAnalyzer: ProtocolAnalyzer;
-  private requestCount = 0;
-  private wsUrl: string;
+  private isProcessing = false;
+  private analyzeLimit = pLimit(10); // Limit concurrent transaction analysis
+  private pollInterval: NodeJS.Timeout | null = null;
 
   constructor(wsUrl: string, db: DataSource) {
-    this.wsUrl = wsUrl;
     this.provider = new ethers.WebSocketProvider(wsUrl);
     this.db = db;
     this.protocolAnalyzer = new ProtocolAnalyzer(this.provider, db);
   }
 
-  private log(
-    level: "debug" | "info" | "warn" | "error",
-    message: string,
-    context: Record<string, any> = {}
-  ) {
-    const requestId = context.requestId || `req_${++this.requestCount}`;
-    this.logger[level](message, {
-      ...context,
-      requestId,
-      timestamp: new Date().toISOString(),
-    });
-  }
-
   async start() {
-    this.log("info", "Starting analytics monitor");
+    this.logger.info("Starting analytics monitor");
     try {
       // Test WebSocket connection first
-      this.log("debug", "Testing WebSocket connection", {
-        endpoint: this.wsUrl,
-      });
+      this.logger.debug("Testing WebSocket connection");
       await this.provider.getBlockNumber();
 
+      // Start monitoring
       await this.setupAnalytics();
+
+      // Initial processing of any backlog
+      await this.processNewData();
     } catch (error) {
       if (error instanceof Error && error.message.includes("ECONNREFUSED")) {
-        this.log("error", "Failed to connect to Ethereum node", {
-          endpoint: this.wsUrl,
+        this.logger.error("Failed to connect to Ethereum node", {
           error: this.formatError(error),
           details:
             "Check if the Ethereum node is running and the WebSocket endpoint is correct",
         });
       } else {
-        this.log("error", "Failed to start analytics monitor", {
+        this.logger.error("Failed to start analytics monitor", {
           error: this.formatError(error),
-          endpoint: this.wsUrl,
         });
       }
       throw error;
@@ -62,50 +50,102 @@ export class AnalyticsMonitor {
 
   private async setupAnalytics() {
     try {
-      // Initialize analytics processing
-      this.log("info", "Setting up analytics processing");
+      this.logger.info("Setting up analytics processing");
 
-      // Start periodic analysis
-      setInterval(() => this.processNewData(), 30000); // Run every 30 seconds
+      // Poll frequently enough to keep up with block time
+      // but not so frequently that we overwhelm the system
+      this.pollInterval = setInterval(() => {
+        if (!this.isProcessing) {
+          this.processNewData().catch((error) => {
+            this.logger.error("Failed to process data in interval", {
+              error: this.formatError(error),
+            });
+          });
+        }
+      }, 3000); // Poll every 3 seconds
     } catch (error) {
-      this.log("error", "Failed to setup analytics", {
+      this.logger.error("Failed to setup analytics", {
         error: this.formatError(error),
       });
+      throw error;
     }
   }
 
   private async processNewData() {
+    if (this.isProcessing) return;
+
+    this.isProcessing = true;
     try {
-      // 1. Get recent unprocessed predictions
-      const predictions = await this.db
+      // Get unprocessed predictions
+      const query = this.db
         .getRepository(BlockPrediction)
         .createQueryBuilder("prediction")
-        .leftJoinAndSelect("prediction.block", "block")
         .where("prediction.transactionDetails IS NOT NULL")
-        .andWhere("prediction.metadata IS NULL") // Use metadata to track if we've analyzed this prediction
+        .andWhere("prediction.metadata IS NULL")
         .orderBy("prediction.blockNumber", "DESC")
-        .take(50)
-        .getMany();
+        .take(100);
 
-      this.log("debug", `Processing ${predictions.length} predictions`);
+      // Log the query being executed
+      this.logger.debug("Executing query", {
+        sql: query.getSql(),
+        parameters: query.getParameters(),
+      });
 
-      for (const prediction of predictions) {
-        const metadata: Record<string, any> = {
-          protocols: {},
-          types: {},
-          totalValue: "0",
-          processedAt: new Date().toISOString(),
-        };
+      const predictions = await query.getMany();
 
-        // 2. Analyze each predicted transaction
-        for (const txHash of prediction.predictedTransactions) {
-          const txDetails = prediction.transactionDetails[txHash];
-          if (!txDetails) continue;
+      this.logger.debug(`Found ${predictions.length} unprocessed predictions`, {
+        blockNumbers: predictions.map((p) => p.blockNumber),
+      });
 
-          // 3. Get protocol information if not already present
-          if (!txDetails.protocol || !txDetails.type) {
+      if (predictions.length === 0) return;
+
+      this.logger.info(`Processing ${predictions.length} predictions`);
+
+      // Process predictions in parallel
+      await Promise.all(
+        predictions.map((prediction) => this.analyzePrediction(prediction))
+      );
+
+      this.logger.info("Completed processing predictions");
+    } catch (error) {
+      this.logger.error("Failed to process analytics", {
+        error: this.formatError(error),
+      });
+    } finally {
+      this.isProcessing = false;
+    }
+  }
+
+  private async analyzePrediction(prediction: BlockPrediction) {
+    this.logger.debug(
+      `Analyzing prediction for block ${prediction.blockNumber}`,
+      {
+        txCount: prediction.predictedTransactions.length,
+      }
+    );
+
+    const metadata: Record<string, any> = {
+      protocols: {},
+      types: {},
+      totalValue: "0",
+      processedAt: new Date().toISOString(),
+    };
+
+    try {
+      let analyzedCount = 0;
+      let skippedCount = 0;
+
+      // Analyze transactions in parallel with concurrency limit
+      await Promise.all(
+        prediction.predictedTransactions.map((txHash) =>
+          this.analyzeLimit(async () => {
+            const txDetails = prediction.transactionDetails[txHash];
+            if (!txDetails || (txDetails.protocol && txDetails.type)) {
+              skippedCount++;
+              return;
+            }
+
             try {
-              // Reconstruct transaction object for analysis
               const tx = {
                 hash: txHash,
                 to: txDetails.to,
@@ -117,13 +157,12 @@ export class AnalyticsMonitor {
               const protocolInfo =
                 await this.protocolAnalyzer.analyzeTransaction(tx as any);
               if (protocolInfo) {
-                // Update transaction details with protocol information
+                analyzedCount++;
                 prediction.transactionDetails[txHash] = {
                   ...txDetails,
                   ...protocolInfo,
                 };
 
-                // Update metadata counters
                 if (protocolInfo.protocol) {
                   metadata.protocols[protocolInfo.protocol] =
                     (metadata.protocols[protocolInfo.protocol] || 0) + 1;
@@ -139,37 +178,47 @@ export class AnalyticsMonitor {
                 }
               }
             } catch (error) {
-              this.log("debug", "Failed to analyze transaction", {
+              this.logger.debug("Failed to analyze transaction", {
                 error: this.formatError(error),
                 txHash,
               });
             }
-          }
-        }
+          })
+        )
+      );
 
-        // 4. Update prediction with new metadata
-        try {
-          await this.db.getRepository(BlockPrediction).update(
-            { id: prediction.id },
-            {
-              transactionDetails: prediction.transactionDetails,
-              metadata,
-            }
-          );
-        } catch (error) {
-          this.log("error", "Failed to update prediction with analytics", {
-            error: this.formatError(error),
-            predictionId: prediction.id,
-          });
+      this.logger.info(
+        `Completed analyzing prediction ${prediction.blockNumber}`,
+        {
+          analyzedTxs: analyzedCount,
+          skippedTxs: skippedCount,
+          protocols: Object.keys(metadata.protocols),
+          types: Object.keys(metadata.types),
         }
-      }
+      );
 
-      this.log("debug", "Completed processing predictions");
+      // Update prediction with new data
+      await this.db.getRepository(BlockPrediction).update(
+        { id: prediction.id },
+        {
+          transactionDetails: prediction.transactionDetails,
+          metadata,
+        }
+      );
     } catch (error) {
-      this.log("error", "Failed to process analytics", {
+      this.logger.error("Failed to analyze prediction", {
         error: this.formatError(error),
+        predictionId: prediction.id,
       });
     }
+  }
+
+  async stop() {
+    if (this.pollInterval) {
+      clearInterval(this.pollInterval);
+      this.pollInterval = null;
+    }
+    this.logger.info("Analytics monitor stopped");
   }
 
   private formatError(error: unknown): string {
